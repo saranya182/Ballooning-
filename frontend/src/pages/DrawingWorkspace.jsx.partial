@@ -1,0 +1,163 @@
+const handleBalloonPointerUp =
+    async (event) => {
+      const drag =
+        dragBalloonRef.current;
+
+      if (!drag) return;
+
+      dragBalloonRef.current =
+        null;
+
+      const balloon =
+        balloons.find(
+          (item) =>
+            item._id ===
+            drag.balloonId
+        );
+
+      if (!balloon) return;
+      
+      const movedDistance = Math.hypot(
+        (event?.clientX ?? drag.initialX) - drag.initialX,
+        (event?.clientY ?? drag.initialY) - drag.initialY
+      );
+      const isClick = movedDistance < 5;
+      const isAnchorDrag = drag.isAnchorDrag === true;
+
+      const characteristic = characteristics.find(item => item.balloonId === balloon._id);
+      const metrics = canvasMetrics();
+
+      const xRel = balloon.xRel ?? (metrics ? clamp01(balloon.x / metrics.w) : null);
+      const yRel = balloon.yRel ?? (metrics ? clamp01(balloon.y / metrics.h) : null);
+      const anchorXRel =
+        balloon.anchorXRel ??
+        (metrics && balloon.anchorX != null
+          ? clamp01(balloon.anchorX / metrics.w)
+          : null);
+      const anchorYRel =
+        balloon.anchorYRel ??
+        (metrics && balloon.anchorY != null
+          ? clamp01(balloon.anchorY / metrics.h)
+          : null);
+
+      /* ---------------------------------------------------------
+         CLICK (not drag): read dimension at anchor and update
+         --------------------------------------------------------- */
+      if (isClick && !isAnchorDrag && pdfPage) {
+        console.log('[BalloonClick] Reading dimension at anchor:', {
+          balloonId: balloon._id,
+          balloonNumber: balloon.number,
+          anchorX: Math.round(anchorXRel * metrics.w),
+          anchorY: Math.round(anchorYRel * metrics.h)
+        });
+
+        try {
+          const anchorX = anchorXRel * metrics.w;
+          const anchorY = anchorYRel * metrics.h;
+
+          const detected = await readDimensionAtPoint(anchorX, anchorY);
+
+          if (detected) {
+            console.log('[BalloonClick] Dimension detected:', {
+              specification: detected.specification,
+              value: detected.value,
+              plusTolerance: detected.plusTolerance,
+              minusTolerance: detected.minusTolerance,
+              source: detected.source
+            });
+
+            /* Update characteristic in backend */
+            if (characteristic) {
+              const updatedChar = await api.put(`/characteristics/${characteristic._id}`, {
+                specification: detected.specification,
+                value: detected.value,
+                plusTolerance: detected.plusTolerance,
+                minusTolerance: detected.minusTolerance,
+                upperLimit: detected.upperLimit,
+                lowerLimit: detected.lowerLimit,
+                type: detected.type,
+                status: detected.source === 'pdf' ? 'Verified' : 
+                       (detected.source?.startsWith('ocr') && detected.ocrConfidence >= 50 ? 'Verified' : 'Needs verification')
+              });
+
+              if (updatedChar) {
+                setCharacteristics(prev =>
+                  prev.map(item => item._id === characteristic._id ? { ...item, ...updatedChar } : item)
+                );
+              }
+            }
+
+            /* Update balloon text */
+            const updatedBalloon = await api.put(`/balloons/${balloon._id}`, {
+              text: detected.text,
+              type: detected.type,
+              status: detected.source === 'pdf' ? 'Verified' : 
+                     (detected.source?.startsWith('ocr') && detected.ocrConfidence >= 50 ? 'Verified' : 'Needs verification')
+            });
+
+            setBalloons(prev => prev.map(item => item._id === balloon._id ? { ...item, ...updatedBalloon } : item));
+
+            /* Refresh editor panel */
+            syncEditFromBalloon(balloon._id);
+
+            setMessage(`Balloon ${balloon.number}: dimension read as "${detected.specification}"`);
+          } else {
+            setMessage(`Balloon ${balloon.number}: no dimension found at anchor`);
+          }
+        } catch (error) {
+          console.error('[BalloonClick] Dimension read failed:', error);
+          setMessage('Failed to read dimension');
+        }
+        
+        /* Click handled - don't proceed to drag logic */
+        return;
+      }
+
+      /* ---------------------------------------------------------
+         DRAG: save new position
+         --------------------------------------------------------- */
+      try {
+        const updatedBalloon = await api.put(`/balloons/${balloon._id}`, {
+          xRel,
+          yRel,
+          anchorXRel,
+          anchorYRel,
+          x: metrics && xRel != null ? xRel * metrics.w : balloon.x,
+          y: metrics && yRel != null ? yRel * metrics.h : balloon.y,
+          anchorX:
+            metrics && anchorXRel != null
+              ? anchorXRel * metrics.w
+              : balloon.anchorX,
+          anchorY:
+            metrics && anchorYRel != null
+              ? anchorYRel * metrics.h
+              : balloon.anchorY
+        });
+
+        if (characteristic) {
+          await api.put(`/characteristics/${characteristic._id}`, {
+            xRel,
+            yRel,
+            x: metrics && xRel != null ? xRel * metrics.w : characteristic.x,
+            y: metrics && yRel != null ? yRel * metrics.h : characteristic.y
+          });
+          
+          setCharacteristics(prev =>
+            prev.map(item => item._id === characteristic._id ? { ...item, xRel, yRel } : item)
+          );
+        }
+
+        setBalloons(prev => prev.map(item => item._id === balloon._id ? { ...item, ...updatedBalloon } : item));
+        setMessage(`Balloon ${balloon.number} moved`);
+      } catch (error) {
+        console.error(
+          'Failed to save balloon position:',
+          error
+        );
+
+        setMessage(
+          error.message ||
+          'Failed to save balloon position'
+        );
+      }
+    };

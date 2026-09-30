@@ -103,6 +103,20 @@ const characteristicSchema = new mongoose.Schema(
       default: 0
     },
 
+    /*
+      Page-relative position (0..1) - stays locked to the
+      detected dimension regardless of the zoom level.
+    */
+    xRel: {
+      type: Number,
+      default: null
+    },
+
+    yRel: {
+      type: Number,
+      default: null
+    },
+
     status: {
       type: String,
       default: 'Needs Verification'

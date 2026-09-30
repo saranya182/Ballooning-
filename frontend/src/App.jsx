@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Routes, Route, Navigate, Link, useNavigate } from 'react-router-dom';
+import { Routes, Route, Navigate, Link, useNavigate, useLocation } from 'react-router-dom';
 import { LayoutDashboard, FilePlus2, LogOut, CheckCircle2, ClipboardList, FileText, Send } from 'lucide-react';
 import api from './services/api';
 import Login from './pages/Login';
@@ -17,6 +17,12 @@ const ProtectedRoute = ({ children }) => {
 
 const AppShell = ({ children }) => {
   const navigate = useNavigate();
+  const { pathname } = useLocation();
+
+  // Drawing workspace header must sit flush against the black
+  // top bar, so that page gets no top padding inside <main>.
+  const flushTop = /^\/projects\/[^/]+$/.test(pathname);
+
   const handleLogout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('user');
@@ -42,7 +48,7 @@ const AppShell = ({ children }) => {
           </button>
         </div>
       </header>
-      <main className="flex-1 overflow-y-auto p-6">{children}</main>
+      <main className={`flex-1 overflow-y-auto px-6 pb-6 ${flushTop ? 'pt-0' : 'pt-6'}`}>{children}</main>
     </div>
   );
 };

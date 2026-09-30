@@ -44,6 +44,31 @@ const balloonSchema = new mongoose.Schema(
       default: 0
     },
 
+    /*
+      Page-relative position (0..1) of the balloon and its
+      arrow anchor. Unlike x/y (canvas pixels) these values
+      do not change when the drawing is zoomed.
+    */
+    xRel: {
+      type: Number,
+      default: null
+    },
+
+    yRel: {
+      type: Number,
+      default: null
+    },
+
+    anchorXRel: {
+      type: Number,
+      default: null
+    },
+
+    anchorYRel: {
+      type: Number,
+      default: null
+    },
+
     text: {
       type: String,
       default: ''

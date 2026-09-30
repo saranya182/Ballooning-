@@ -26,8 +26,18 @@ import * as XLSX from 'xlsx';
 import api from '../services/api';
 import { enhanceDetections } from '../utils/engineeringDetection';
 import { contextualFilter } from '../utils/contextualFilter';
+import { detectPatterns } from '../utils/patternMatcher';
+import {
+  normalizeCallout,
+  composeSpecification,
+  parseCalloutText
+} from '../utils/calloutFormat';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
+
+/* Pointer travel (device px) below this counts as a click; anything
+   above is a drag and must never re-read / overwrite a value. */
+const DRAG_CLICK_THRESHOLD = 5;
 
 /* =========================================================
    DETECTION HELPERS (shared by Auto Detect, Add Dimension
@@ -57,7 +67,7 @@ const DETECTION_PATTERNS = {
   radius: /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*R\s*\d+(?:\.\d+)?\s*$/i,
   dimension:
     /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*\d{1,4}(?:\.\d{1,4})?(?:\s*(?:mm|in|inch|inches|THRU|ALL|DP|DEEP|TYP|PLACES|MAX|MIN|REF))*\s*$/i,
-  smallTolerance: /^\s*[+-±]?\s*0?\.\d{1,3}\s*$/,
+  smallTolerance: /^\s*[+\-±]?\s*0?\.\d{1,3}\s*$/,
   fit:
     /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*\d+(?:\.\d+)?\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*$/i,
   angle: /^\s*\d+(?:\.\d+)?\s*°\s*$/,
@@ -72,7 +82,56 @@ const DETECTION_PATTERNS = {
   symbol: /^\s*(Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|⌵|x)\s*$/i
 };
 
-const isDetectionText = (rawText) => {
+const isDimensionPattern = (text) =>
+  DETECTION_PATTERNS.dimension.test(text) ||
+  DETECTION_PATTERNS.diameter.test(text) ||
+  DETECTION_PATTERNS.radius.test(text) ||
+  DETECTION_PATTERNS.tolerance.test(text) ||
+  DETECTION_PATTERNS.bilateral.test(text) ||
+  DETECTION_PATTERNS.fit.test(text) ||
+  DETECTION_PATTERNS.thread.test(text) ||
+  DETECTION_PATTERNS.angle.test(text) ||
+  DETECTION_PATTERNS.angleTolerance.test(text);
+
+/*
+  A reading is only usable when its VALUE reads as a real callout:
+  at least one digit, and the callout parser accepts it as confident.
+  This drops OCR noise ("[}", "C1") and tolerance-only lines
+  ("±0.05", "0.05/0.03") that carry no nominal - storing those is
+  worse than storing nothing, because the panel then shows a value
+  that does not exist on the drawing.
+*/
+const isReadableCallout = (parsed) => {
+  const value = String(
+    (parsed && parsed.value) || ''
+  ).trim();
+
+  if (!/\d/.test(value)) {
+    return false;
+  }
+
+  /*
+    A nominal of zero ("0", "00", "Ø0", "0.00") is not a dimension -
+    it is a stray glyph, most often a fragment picked up by one of the
+    rotated OCR passes or a tolerance line with no nominal on it.
+    parseNearestDimension will happily build "Ø0" out of a single "0"
+    that matches the standalone-symbol pattern, and because the rotated
+    passes often land inside the dragged box while the real callout
+    scores no higher, that junk used to WIN and the side panel then
+    showed "Ø 0" with 0.00 tolerances instead of the actual value.
+    Real callouts always carry a non-zero digit ("0.5" survives), and
+    an all-zero reading still reaches the best-effort fallback when
+    nothing better was read.
+  */
+  if (!/[1-9]/.test(value)) {
+    return false;
+  }
+
+  const parts = parseCalloutText(value);
+  return !!(parts && parts.confident);
+};
+
+const isDetectionText = (rawText, options = {}) => {
   const text = normalizeDetectionText(rawText);
 
   if (!text) {
@@ -95,21 +154,87 @@ const isDetectionText = (rawText) => {
     return false;
   }
 
-  if (/^\d{4,}$/.test(text)) {
+  /*
+    A bare 4+ digit run is normally a drawing number or a date, so it
+    is skipped during auto-detection - but when the operator dragged a
+    box over it they are pointing straight at the value, and real
+    dimensions like 1000 / 2500 would otherwise never be read.
+  */
+  if (!options.allowLongNumbers && /^\d{4,}$/.test(text)) {
     return false;
   }
 
   return true; // Always allow any text/number during manual ballooning
 };
 
-const detectionCenterX = (item) =>
-  Number(item.x || 0) + Number(item.width || 0) / 2;
+/*
+  mat maps text space -> canvas device pixels. Dimension callouts are
+  often rotated (vertical Ø callouts), and then the baseline no longer
+  runs along +x, so the centre has to be projected along the real text
+  direction instead of being assumed horizontal.
+*/
+const textAxes = (item) => {
+  const mat = item && item.mat;
+
+  if (!mat || mat.length < 4) {
+    return null;
+  }
+
+  const alongLength = Math.hypot(mat[0], mat[1]);
+  const upLength = Math.hypot(mat[2], mat[3]);
+
+  if (!(alongLength > 0) || !(upLength > 0)) {
+    return null;
+  }
+
+  return {
+    along: [mat[0] / alongLength, mat[1] / alongLength],
+    up: [mat[2] / upLength, mat[3] / upLength]
+  };
+};
+
+const detectionCenterX = (item) => {
+  const width = Number(item.width || 0);
+  const axes = item.source === 'ocr' ? null : textAxes(item);
+
+  if (axes) {
+    return (
+      Number(item.x || 0) +
+      axes.along[0] * (width / 2) +
+      axes.up[0] * (Number(item.height || 0) / 2)
+    );
+  }
+
+  return Number(item.x || 0) + width / 2;
+};
 
 // PDF text y is the BASELINE (bottom), OCR y is the TOP of the box.
-const detectionCenterY = (item) =>
-  item.source === 'ocr'
-    ? Number(item.y || 0) + Number(item.height || 0) / 2
-    : Number(item.y || 0) - Number(item.height || 0) / 2;
+const detectionCenterY = (item) => {
+  const y = Number(item.y || 0);
+  const height = Number(item.height || 0);
+
+  if (item.source === 'ocr') {
+    return y + height / 2;
+  }
+
+  const axes = textAxes(item);
+
+  if (axes) {
+    return (
+      y +
+      axes.along[1] * (Number(item.width || 0) / 2) +
+      axes.up[1] * (height / 2)
+    );
+  }
+
+  return y - height / 2;
+};
+
+/* Balloon positions are stored as page-relative fractions
+   (0..1) so they stay locked to the same spot on the drawing
+   at any zoom level. */
+const clamp01 = (value) =>
+  Math.max(0, Math.min(1, Number(value) || 0));
 
 /* =========================================================
    STATUS
@@ -120,6 +245,14 @@ const detectionCenterY = (item) =>
 const statusForDetection = (detected) => {
   if (!detected) {
     return 'Draft';
+  }
+
+  /*
+    The reading pipeline could not parse the callout confidently and
+    fell back to the raw OCR text - it must never look Verified.
+  */
+  if (detected.needsVerification) {
+    return 'Needs verification';
   }
 
   if (detected.source === 'pdf') {
@@ -365,9 +498,33 @@ const clusterDetectionsIntoDimensions = (detections) => {
   return result;
 };
 
+/* 100% zoom is the drawing's real printed size - 96 screen pixels
+   per inch, which is what the operating system's own PDF viewer
+   renders at 100%. Everything below that is a deliberate zoom-out,
+   so the label always reports the true size of what you are seeing. */
+const PHYSICAL_SCALE = 96 / 72;
+const MIN_ZOOM = PHYSICAL_SCALE * 0.25;
+const MAX_ZOOM = PHYSICAL_SCALE * 2;
+
+/* Safety valve for large-format sheets: an A0 page rendered at the
+   real printed size on a 2x display would ask for a quarter of a
+   gigabyte of bitmap.  Past this area the scale is eased back so
+   the browser never runs out of canvas. */
+const MAX_CANVAS_PIXELS = 30000000;
+
 export default function DrawingWorkspace() {
   const { id } = useParams();
-  const dRatio = window.devicePixelRatio || 2;
+  /* Exactly one backing-store pixel per screen pixel.  Rendering at
+     max(devicePixelRatio, 2) forced the browser to downscale the
+     canvas on 125% / 150% Windows displays, and that resample is
+     what made every line and number look soft. */
+  const dRatio = window.devicePixelRatio || 1;
+
+  /* Balloons saved before this change were written as canvas pixels
+     produced by the old max(devicePixelRatio, 2) backing store.
+     Every conversion of those stored values keeps that ratio, or
+     the markers would shift on 1x and 1.5x screens. */
+  const legacyDRatio = Math.max(window.devicePixelRatio || 1, 2);
 
   const canvasRef = useRef(null);
   const pdfContainerRef = useRef(null);
@@ -379,9 +536,21 @@ export default function DrawingWorkspace() {
   const selectionRef = useRef(null);
   const [selection, setSelection] = useState(null);
 
-  // Reused OCR worker + full-page render cache (manual scans)
+  // Reused OCR worker + high-res page render cache (vector Ø inspection)
   const ocrWorkerRef = useRef(null);
-  const ocrCacheRef = useRef({});
+  const ocrCacheRef = useRef(null);
+
+  /*
+    Second OCR worker running the Danish model, whose alphabet contains
+    Ø natively - the English model has no such glyph, so it can only
+    ever return a substitute for it. Created on first use; if the model
+    is missing the read simply stays English-only.
+  */
+  const ocrDanWorkerRef = useRef(null);
+  const ocrDanUnavailableRef = useRef(false);
+
+  // Active main-canvas render task (cancelled before each re-render)
+  const renderTaskRef = useRef(null);
 
   // Used for the Add Dimension drag-select
   const addSelectRef = useRef(null);
@@ -402,8 +571,16 @@ export default function DrawingWorkspace() {
   const [previewDetections, setPreviewDetections] = useState([]);
   const roiSelectRef = useRef(null);
 
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(PHYSICAL_SCALE);
   const [renderScale, setRenderScale] = useState(1);
+
+  // Current on-screen size (CSS px) of the drawing canvas.
+  // Balloon overlays are painted against this box.
+  const [viewSize, setViewSize] = useState({ w: 0, h: 0 });
+  // Container width + a tick bumped when the device pixel ratio
+  // changes - both drive re-renders of the PDF canvas.
+  const [containerW, setContainerW] = useState(0);
+  const [renderTick, setRenderTick] = useState(0);
   const [pageNumber, setPageNumber] = useState(1);
   const [pageCount, setPageCount] = useState(1);
 
@@ -583,6 +760,51 @@ export default function DrawingWorkspace() {
       .endsWith('.pdf');
 
   /* =========================================================
+     COORDINATE HELPERS
+     ---------------------------------------------------------
+     Balloon positions are saved as fractions of the rendered
+     page (0..1). Canvas pixels are only used while a gesture
+     is in progress, because pixels change with zoom.
+  ========================================================= */
+
+  const canvasMetrics = () => {
+    const canvas = canvasRef.current;
+
+    if (!canvas || !canvas.width || !canvas.height) {
+      return null;
+    }
+
+    return { w: canvas.width, h: canvas.height };
+  };
+
+  /* The canvas size as legacy pixel coordinates were recorded
+     against - before the backing store was tied to the exact
+     device pixel ratio. */
+  const legacyMetrics = () =>
+    viewSize.w > 0 && viewSize.h > 0
+      ? {
+          w: viewSize.w * legacyDRatio,
+          h: viewSize.h * legacyDRatio
+        }
+      : null;
+
+  /* Zoom that fits the current page inside the viewer panel. */
+  const fitZoom = () => {
+    if (!pdfPage) return PHYSICAL_SCALE;
+
+    const base = pdfPage.getViewport({ scale: 1 });
+    const containerWidth =
+      containerW ||
+      pdfContainerRef.current?.clientWidth ||
+      900;
+
+    return Math.min(
+      MAX_ZOOM,
+      Math.max(MIN_ZOOM, (containerWidth - 40) / base.width)
+    );
+  };
+
+  /* =========================================================
      DISPLAY BALLOONS
   ========================================================= */
 
@@ -590,18 +812,61 @@ export default function DrawingWorkspace() {
     const allBallons = new Map();
     const firstDrawingId = drawings.length > 0 ? drawings[0]._id : null;
 
+    const deviceSize = legacyMetrics();
+
+    const legacyRelX = (px) =>
+      deviceSize && px != null ? Number(px) / deviceSize.w : null;
+
+    const legacyRelY = (py) =>
+      deviceSize && py != null ? Number(py) / deviceSize.h : null;
+
+    // Resolves a stored/legacy anchor into page-relative space.
+    const resolveAnchorRel = (relX, relY, anchorRelX, anchorRelY, anchorX, anchorY) => {
+      if (anchorRelX != null && anchorRelY != null) {
+        return { anchorXRel: anchorRelX, anchorYRel: anchorRelY };
+      }
+
+      const hasPixelAnchor =
+        (anchorX != null || anchorY != null) &&
+        (Number(anchorX) !== 0 || Number(anchorY) !== 0);
+
+      if (hasPixelAnchor && deviceSize) {
+        return {
+          anchorXRel: Number(anchorX) / deviceSize.w,
+          anchorYRel: Number(anchorY) / deviceSize.h
+        };
+      }
+
+      return { anchorXRel: null, anchorYRel: null };
+    };
+
     // Add balloons from balloons state
     (balloons || []).forEach((b) => {
       const belongsTo = b.drawingId || firstDrawingId;
       if (belongsTo && belongsTo !== selectedDrawingId) return;
+
+      const xRel = b.xRel ?? legacyRelX(b.x);
+      const yRel = b.yRel ?? legacyRelY(b.y);
+      const anchor = resolveAnchorRel(
+        xRel,
+        yRel,
+        b.anchorXRel,
+        b.anchorYRel,
+        b.anchorX,
+        b.anchorY
+      );
 
       allBallons.set(b._id, {
         _id: b._id,
         number: b.number,
         x: b.x,
         y: b.y,
+        xRel,
+        yRel,
         anchorX: b.anchorX ?? (b.x || 0) + 25,
         anchorY: b.anchorY ?? (b.y || 0) + 25,
+        anchorXRel: anchor.anchorXRel,
+        anchorYRel: anchor.anchorYRel,
         text: b.text,
         type: b.type,
         page: b.page,
@@ -616,14 +881,30 @@ export default function DrawingWorkspace() {
 
       if (c.balloonId) {
         const existing = allBallons.get(c.balloonId);
+
+        const xRel = existing?.xRel ?? c.xRel ?? legacyRelX(existing?.x ?? c.x);
+        const yRel = existing?.yRel ?? c.yRel ?? legacyRelY(existing?.y ?? c.y);
+        const anchor = resolveAnchorRel(
+          xRel,
+          yRel,
+          existing?.anchorXRel,
+          existing?.anchorYRel,
+          existing?.anchorX,
+          existing?.anchorY
+        );
+
         allBallons.set(c.balloonId, {
           _id: c.balloonId,
           number: c.number,
           x: existing?.x ?? c.x,
           y: existing?.y ?? c.y,
+          xRel,
+          yRel,
           anchorX: existing?.anchorX ?? c.anchorX ?? (c.x || 0) + 25,
           anchorY: existing?.anchorY ?? c.anchorY ?? (c.y || 0) + 25,
-          text: c.specification,
+          anchorXRel: anchor.anchorXRel,
+          anchorYRel: anchor.anchorYRel,
+          text: normalizeCallout(c)?.specification ?? c.specification,
           type: c.type,
           page: c.page,
           status: c.status || 'Draft'
@@ -632,7 +913,7 @@ export default function DrawingWorkspace() {
     });
 
     return Array.from(allBallons.values());
-  }, [balloons, characteristics, selectedDrawingId, drawings]);
+  }, [balloons, characteristics, selectedDrawingId, drawings, viewSize]);
 
   /* =========================================================
      LOAD PDF
@@ -649,6 +930,7 @@ export default function DrawingWorkspace() {
       setPageNumber(1);
       setPageCount(1);
       autoDetectDoneRef.current = false;
+      setRoiRect(null);
       return;
     }
 
@@ -676,6 +958,7 @@ export default function DrawingWorkspace() {
         if (!cancelled) {
           setPdfPage(page);
           autoDetectDoneRef.current = false;
+          setRoiRect(null);
         }
       } catch (error) {
         console.error(
@@ -728,6 +1011,7 @@ export default function DrawingWorkspace() {
         if (!cancelled) {
           setPdfPage(page);
           autoDetectDoneRef.current = false;
+          setRoiRect(null);
         }
       } catch (error) {
         console.error(error);
@@ -761,45 +1045,235 @@ export default function DrawingWorkspace() {
     const context =
       canvas.getContext('2d');
 
+    /*
+      The viewer opens at the drawing's real printed size, so the
+      rasterisation is identical to the original file.  Anything
+      smaller shrinks the dimension text below the resolution the
+      drawing was authored at - the container scrolls instead.
+    */
+    const finalScale = Math.min(
+      MAX_ZOOM,
+      Math.max(MIN_ZOOM, zoom)
+    );
+
     const baseViewport =
-      pdfPage.getViewport({
-        scale: 1
-      });
+      pdfPage.getViewport({ scale: 1 });
 
-    const containerWidth =
-      pdfContainerRef.current
-        ?.clientWidth || 900;
+    let rasterScale = finalScale * dRatio;
 
-    const fitScale =
-      (containerWidth - 40) /
-      baseViewport.width;
+    const area =
+      rasterScale * baseViewport.width *
+      rasterScale * baseViewport.height;
 
-    const finalScale = Math.max(
-      0.5,
-      fitScale * zoom
+    if (area > MAX_CANVAS_PIXELS) {
+      rasterScale *= Math.sqrt(MAX_CANVAS_PIXELS / area);
+    }
+
+    /*
+      Integer backing store, and a CSS size derived FROM it, so the
+      canvas covers exactly backingWidth device pixels at any
+      display density.  Letting a fractional viewport width fall
+      through the canvas' integer truncation leaves the element a
+      pixel out of register with its own bitmap - a second, quieter
+      way for the drawing to come out soft.
+    */
+    const backingWidth = Math.max(
+      1,
+      Math.round(rasterScale * baseViewport.width)
+    );
+
+    const backingHeight = Math.max(
+      1,
+      Math.round(
+        backingWidth * (baseViewport.height / baseViewport.width)
+      )
     );
 
     const viewport =
       pdfPage.getViewport({
-        scale: finalScale * dRatio
+        scale: backingWidth / baseViewport.width
       });
 
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
+    canvas.width = backingWidth;
+    canvas.height = backingHeight;
 
     canvas.style.width =
-      `${viewport.width / dRatio}px`;
+      `${backingWidth / dRatio}px`;
 
     canvas.style.height =
-      `${viewport.height / dRatio}px`;
+      `${backingHeight / dRatio}px`;
+
+    setViewSize({
+      w: backingWidth / dRatio,
+      h: backingHeight / dRatio
+    });
 
     const renderContext = {
       canvasContext: context,
       viewport
     };
 
-    pdfPage.render(renderContext);
-  }, [pdfPage, zoom]);
+    if (renderTaskRef.current) {
+      try {
+        renderTaskRef.current.cancel();
+      } catch (error) {
+        /* previous task already finished */
+      }
+    }
+
+    const renderTask = pdfPage.render(renderContext);
+    renderTaskRef.current = renderTask;
+    renderTask.promise.catch(() => {});
+  }, [pdfPage, zoom, loadingPdf, renderTick]);
+
+  /* Track the viewer panel width (used by the Fit button) and watch
+     the device pixel ratio (monitor switch, browser / OS zoom) so
+     the canvas is always rasterised at the current pixel density. */
+  useEffect(() => {
+    const el = pdfContainerRef.current;
+    if (!el) return;
+
+    const onResize = () => {
+      const w = Math.round(el.clientWidth);
+      setContainerW((prev) => (prev === w ? prev : w));
+    };
+
+    onResize();
+
+    const ro =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(onResize)
+        : null;
+    if (ro) ro.observe(el);
+
+    let mql = null;
+    const watchDpr = () => {
+      if (mql && mql.removeEventListener) {
+        mql.removeEventListener('change', onDprChange);
+      }
+      mql = window.matchMedia(
+        `(resolution: ${window.devicePixelRatio}dppx)`
+      );
+      if (mql.addEventListener) {
+        mql.addEventListener('change', onDprChange);
+      }
+    };
+    function onDprChange() {
+      setRenderTick((t) => t + 1);
+      watchDpr();
+    }
+    watchDpr();
+
+    return () => {
+      if (ro) ro.disconnect();
+      if (mql && mql.removeEventListener) {
+        mql.removeEventListener('change', onDprChange);
+      }
+    };
+  }, []);
+
+  /* =========================================================
+     NORMALIZE LEGACY COORDINATES
+     ---------------------------------------------------------
+     Older balloons stored raw canvas pixels, which drift
+     away from their dimension as soon as the zoom changes.
+     Convert them once to page-relative fractions (and save
+     them) so every existing balloon behaves like a new one.
+  ========================================================= */
+
+  useEffect(() => {
+    if (!viewSize.w || !viewSize.h) {
+      return;
+    }
+
+    const metrics = legacyMetrics();
+
+    if (!metrics) {
+      return;
+    }
+
+    const legacyBalloons = (balloons || []).filter(
+      (item) => item.xRel == null
+    );
+
+    const legacyCharacteristics = (characteristics || []).filter(
+      (item) => item.xRel == null
+    );
+
+    if (
+      legacyBalloons.length === 0 &&
+      legacyCharacteristics.length === 0
+    ) {
+      return;
+    }
+
+    const toRelative = (item) => ({
+      xRel: clamp01((item.x ?? 0) / metrics.w),
+      yRel: clamp01((item.y ?? 0) / metrics.h)
+    });
+
+    const toRelativeAnchor = (item) => {
+      const hasPixelAnchor =
+        (item.anchorX != null || item.anchorY != null) &&
+        (Number(item.anchorX) !== 0 ||
+          Number(item.anchorY) !== 0);
+
+      if (!hasPixelAnchor) {
+        return { anchorXRel: null, anchorYRel: null };
+      }
+
+      return {
+        anchorXRel: clamp01(item.anchorX / metrics.w),
+        anchorYRel: clamp01(item.anchorY / metrics.h)
+      };
+    };
+
+    setBalloons((prev) =>
+      prev.map((item) => {
+        if (item.xRel != null) return item;
+
+        return {
+          ...item,
+          ...toRelative(item),
+          ...toRelativeAnchor(item)
+        };
+      })
+    );
+
+    setCharacteristics((prev) =>
+      prev.map((item) =>
+        item.xRel != null
+          ? item
+          : { ...item, ...toRelative(item) }
+      )
+    );
+
+    // Persist so the conversion only ever runs once.
+    legacyBalloons.forEach(async (item) => {
+      try {
+        await api.put(`/balloons/${item._id}`, {
+          ...toRelative(item),
+          ...toRelativeAnchor(item)
+        });
+      } catch (error) {
+        console.error(
+          'Failed to migrate balloon coordinates:',
+          error
+        );
+      }
+    });
+
+    legacyCharacteristics.forEach(async (item) => {
+      try {
+        await api.put(`/characteristics/${item._id}`, toRelative(item));
+      } catch (error) {
+        console.error(
+          'Failed to migrate characteristic coordinates:',
+          error
+        );
+      }
+    });
+  }, [viewSize, balloons, characteristics]);
 
 /* =========================================================
       DOWNLOAD PDF WITH BALLOONS
@@ -891,19 +1365,28 @@ export default function DrawingWorkspace() {
       context.lineJoin = 'round';
 
       for (const balloon of pageBalloons) {
-        const x =
-          (balloon.x ?? 0) * ratio;
+        // Balloon positions are page-relative fractions, so they
+        // land on the same spot on the exported page no matter
+        // what zoom level the drawing was at.
+        const canvasW = canvasRef.current?.width || 1;
+        const canvasH = canvasRef.current?.height || 1;
 
-        const y =
-          (balloon.y ?? 0) * ratio;
+        const rx =
+          balloon.xRel ?? (balloon.x ?? 0) / canvasW;
 
-        const ax =
-          (balloon.anchorX ?? x + 12) *
-          ratio;
+        const ry =
+          balloon.yRel ?? (balloon.y ?? 0) / canvasH;
 
-        const ay =
-          (balloon.anchorY ?? y + 12) *
-          ratio;
+        const arx =
+          balloon.anchorXRel ?? rx + 25 / canvasW;
+
+        const ary =
+          balloon.anchorYRel ?? ry + 25 / canvasH;
+
+        const x = rx * viewport.width;
+        const y = ry * viewport.height;
+        const ax = arx * viewport.width;
+        const ay = ary * viewport.height;
 
         // Direction from the balloon TOWARDS the value
         const dx = ax - x;
@@ -1049,13 +1532,16 @@ export default function DrawingWorkspace() {
         (a, b) => (a.number || 0) - (b.number || 0)
       );
 
-      const tableData = sortedCharacteristics.map((char) => [
-        String(char.number || ''),
-        String(char.specification || ''),
-        String(char.value || ''),
-        String(char.plusTolerance || ''),
-        String(char.minusTolerance || '')
-      ]);
+      const tableData = sortedCharacteristics.map((char) => {
+        const d = getDisplayValues(char);
+        return [
+          String(char.number || ''),
+          String(d.specification || ''),
+          String(d.mainVal || ''),
+          String(d.plusTol || ''),
+          String(d.minusTol || '')
+        ];
+      });
 
       autoTable(pdf, {
         startY: 25,
@@ -1128,50 +1614,91 @@ export default function DrawingWorkspace() {
     try {
       setAddScanning(true);
 
-      const scanned =
-        await scanDimensionInRect(rect);
+      const centerX = (rect.x1 + rect.x2) / 2;
+      const centerY = (rect.y1 + rect.y2) / 2;
 
-      const centerX =
-        (rect.x1 + rect.x2) / 2;
-
-      const centerY =
-        (rect.y1 + rect.y2) / 2;
+      /*
+        Use the unified dimension reading pipeline - handing it the
+        dragged box so the value inside that box is the one read
+        (horizontal or vertical) instead of whatever sits nearest the
+        centre point.
+      */
+      const detected = await readDimensionAtPoint(centerX, centerY, {
+        rect
+      });
 
       /*
         Always place a balloon wherever the user drags.
-        If no dimension text could be read, use an empty
-        placeholder they can fill in from the side panel.
+        If no dimension text could be read, leave the value blank so the
+        side panel prompts for the real number rather than showing a
+        placeholder word as if it were the drawing's text.
       */
 
-      const detected =
-        scanned || {
-          text: '',
-          value: '',
-          type: 'Dimension',
-          plusTolerance: '0.00',
-          minusTolerance: '0.00',
-          upperLimit: '0.00',
-          lowerLimit: '0.00',
-          specification: 'Dimension',
-          centerX,
-          centerY
-        };
+      const fallbackDetected = detected || {
+        text: '',
+        value: '',
+        type: 'Dimension',
+        plusTolerance: '0.00',
+        minusTolerance: '0.00',
+        upperLimit: '0.00',
+        lowerLimit: '0.00',
+        specification: '',
+        centerX,
+        centerY
+      };
 
+      /*
+        The balloon must stay where the user marked. Snap the leader
+        onto the detected text only when it agrees with the selection:
+        inside the dragged box (a wide box puts the centre far from the
+        value) or close to it for a plain point read.
+      */
       let anchorX = centerX;
       let anchorY = centerY;
-      let balloonX = Math.max(0, centerX - 28);
-      let balloonY = Math.max(0, centerY - 28);
 
-      // Point the arrow at the read value and
-      // place the balloon away from it.
-      anchorX = detected.centerX;
-      anchorY = detected.centerY;
-      balloonX = Math.max(0, anchorX + 25);
-      balloonY = Math.max(0, anchorY - 25);
+      const detectedAnchorX = Number(fallbackDetected.centerX);
+      const detectedAnchorY = Number(fallbackDetected.centerY);
+
+      const snapPad = 25 * dRatio;
+      const snapLeft = Math.min(rect.x1, rect.x2) - snapPad;
+      const snapRight = Math.max(rect.x1, rect.x2) + snapPad;
+      const snapTop = Math.min(rect.y1, rect.y2) - snapPad;
+      const snapBottom = Math.max(rect.y1, rect.y2) + snapPad;
+
+      const detectedInsideSelection =
+        Number.isFinite(detectedAnchorX) &&
+        Number.isFinite(detectedAnchorY) &&
+        detectedAnchorX >= snapLeft &&
+        detectedAnchorX <= snapRight &&
+        detectedAnchorY >= snapTop &&
+        detectedAnchorY <= snapBottom;
+
+      if (
+        detectedInsideSelection ||
+        (Number.isFinite(detectedAnchorX) &&
+          Number.isFinite(detectedAnchorY) &&
+          Math.hypot(detectedAnchorX - centerX, detectedAnchorY - centerY) <=
+            45 * dRatio)
+      ) {
+        anchorX = detectedAnchorX;
+        anchorY = detectedAnchorY;
+      }
+
+      const balloonX = Math.max(0, anchorX + 25);
+      const balloonY = Math.max(0, anchorY - 25);
 
       const nextNumber = getNextBalloonNumber();
 
-      const status = statusForDetection(detected);
+      const status = statusForDetection(fallbackDetected);
+
+      /* Page-relative positions keep the balloon glued to the
+         dimension even after the drawing is zoomed. */
+      const metrics = canvasMetrics();
+
+      const xRel = metrics ? clamp01(balloonX / metrics.w) : null;
+      const yRel = metrics ? clamp01(balloonY / metrics.h) : null;
+      const anchorXRel = metrics ? clamp01(anchorX / metrics.w) : null;
+      const anchorYRel = metrics ? clamp01(anchorY / metrics.h) : null;
 
       const balloon = await api.post(
         `/projects/${id}/balloons`,
@@ -1181,8 +1708,12 @@ export default function DrawingWorkspace() {
           y: balloonY,
           anchorX,
           anchorY,
-          text: detected.text,
-          type: detected.type,
+          xRel,
+          yRel,
+          anchorXRel,
+          anchorYRel,
+          text: fallbackDetected.text,
+          type: fallbackDetected.type,
           number: nextNumber,
           page: pageNumber,
           status
@@ -1195,14 +1726,15 @@ export default function DrawingWorkspace() {
           drawingId: selectedDrawingId,
           balloonId: balloon._id,
           number: nextNumber,
-          type: detected.type,
-          value: detected.value,
-          unit: 'mm',
-          plusTolerance: detected.plusTolerance,
-          minusTolerance: detected.minusTolerance,
-          upperLimit: detected.upperLimit,
-          lowerLimit: detected.lowerLimit,
-          specification: detected.specification,
+          type: fallbackDetected.type,
+          value: fallbackDetected.value,
+          unit:
+            fallbackDetected.type === 'Angle' ? 'deg' : 'mm',
+          plusTolerance: fallbackDetected.plusTolerance,
+          minusTolerance: fallbackDetected.minusTolerance,
+          upperLimit: fallbackDetected.upperLimit ?? '0.00',
+          lowerLimit: fallbackDetected.lowerLimit ?? '0.00',
+          specification: fallbackDetected.specification,
           inspectionMethod: 'Vernier Caliper',
           instrument: '',
           actualValue: '',
@@ -1211,6 +1743,8 @@ export default function DrawingWorkspace() {
           page: pageNumber,
           x: anchorX,
           y: anchorY,
+          xRel: anchorXRel,
+          yRel: anchorYRel,
           status
         }
       );
@@ -1222,6 +1756,10 @@ export default function DrawingWorkspace() {
           number: nextNumber,
           x: balloonX,
           y: balloonY,
+          xRel,
+          yRel,
+          anchorXRel,
+          anchorYRel,
           page: pageNumber,
           drawingId: selectedDrawingId
         }
@@ -1232,6 +1770,8 @@ export default function DrawingWorkspace() {
         {
           ...characteristic,
           number: nextNumber,
+          xRel: anchorXRel,
+          yRel: anchorYRel,
           page: pageNumber,
           drawingId: selectedDrawingId
         }
@@ -1241,8 +1781,10 @@ export default function DrawingWorkspace() {
       setSelectedBalloonId(balloon._id);
 
       setMessage(
-        scanned
-          ? `Balloon ${nextNumber}: "${detected.specification}" read from the drawing`
+        detected
+          ? detected.needsVerification
+            ? `Balloon ${nextNumber}: read "${fallbackDetected.specification}" - check this value in the side panel.`
+            : `Balloon ${nextNumber}: "${fallbackDetected.specification}" read from the drawing`
           : `Balloon ${nextNumber} added at that spot. Fill in its value in the side panel.`
       );
     } catch (error) {
@@ -1280,6 +1822,45 @@ export default function DrawingWorkspace() {
     };
   };
 
+  /*
+    The ROI (yellow) box is stored in page-relative fractions - the
+    same convention balloon positions use - so it stays pinned to the
+    same part of the drawing when the canvas is resized for zoom.
+    Storing absolute device pixels made the box drift (and the
+    auto-detect filter apply to the wrong region) on every zoom.
+  */
+  const roiPointToRelative = (point) => {
+    const metrics = canvasMetrics();
+
+    if (!metrics) {
+      return { x: point.x, y: point.y };
+    }
+
+    return {
+      x: point.x / metrics.w,
+      y: point.y / metrics.h
+    };
+  };
+
+  const roiRectToCanvas = (rect) => {
+    if (!rect) {
+      return null;
+    }
+
+    const metrics = canvasMetrics();
+
+    if (!metrics) {
+      return rect;
+    }
+
+    return {
+      x1: rect.x1 * metrics.w,
+      y1: rect.y1 * metrics.h,
+      x2: rect.x2 * metrics.w,
+      y2: rect.y2 * metrics.h
+    };
+  };
+
   const handleAddPointerDown = (event) => {
     if (!canvasRef.current) return;
     if (event.target.closest('.balloon-marker')) return;
@@ -1291,9 +1872,9 @@ export default function DrawingWorkspace() {
       event.preventDefault();
       event.currentTarget.setPointerCapture?.(event.pointerId);
     } else if (mode === 'select_area') {
-      const point = clientToCanvasPoint(event);
-      roiSelectRef.current = { startX: point.x, startY: point.y };
-      setRoiRect({ x1: point.x, y1: point.y, x2: point.x, y2: point.y });
+      const rp = roiPointToRelative(clientToCanvasPoint(event));
+      roiSelectRef.current = { startX: rp.x, startY: rp.y };
+      setRoiRect({ x1: rp.x, y1: rp.y, x2: rp.x, y2: rp.y });
       event.preventDefault();
       event.currentTarget.setPointerCapture?.(event.pointerId);
     }
@@ -1311,13 +1892,13 @@ export default function DrawingWorkspace() {
         y2: Math.max(start.startY, point.y)
       });
     } else if (mode === 'select_area' && roiSelectRef.current) {
-      const point = clientToCanvasPoint(event);
+      const rp = roiPointToRelative(clientToCanvasPoint(event));
       const start = roiSelectRef.current;
       setRoiRect({
-        x1: Math.min(start.startX, point.x),
-        y1: Math.min(start.startY, point.y),
-        x2: Math.max(start.startX, point.x),
-        y2: Math.max(start.startY, point.y)
+        x1: Math.min(start.startX, rp.x),
+        y1: Math.min(start.startY, rp.y),
+        x2: Math.max(start.startX, rp.x),
+        y2: Math.max(start.startY, rp.y)
       });
     }
   };
@@ -1337,14 +1918,31 @@ export default function DrawingWorkspace() {
       setSelectRect(null);
       const width = rect.x2 - rect.x1;
       const height = rect.y2 - rect.y1;
-      if (width < 5 && height < 5) {
+      if (width < 5 * dRatio && height < 5 * dRatio) {
         const cx = (rect.x1 + rect.x2) / 2;
         const cy = (rect.y1 + rect.y2) / 2;
-        rect = { x1: cx - 25, y1: cy - 25, x2: cx + 25, y2: cy + 25 };
+        const half = 25 * dRatio;
+        rect = { x1: cx - half, y1: cy - half, x2: cx + half, y2: cy + half };
       }
       await addDimensionAtRect(rect);
     } else if (mode === 'select_area' && roiSelectRef.current) {
       roiSelectRef.current = null;
+
+      /*
+        A click that never dragged would leave a zero-sized box,
+        which would filter every detection out of Auto Detect.
+        Treat it as "no area selected".
+      */
+      const roi = roiRectToCanvas(roiRect);
+
+      if (
+        !roi ||
+        Math.abs(roi.x2 - roi.x1) < 5 * dRatio ||
+        Math.abs(roi.y2 - roi.y1) < 5 * dRatio
+      ) {
+        setRoiRect(null);
+      }
+
       setMode('none');
     }
   };
@@ -1557,6 +2155,7 @@ export default function DrawingWorkspace() {
       setCharacteristics([]);
       setSelectedBalloonId(null);
       autoDetectDoneRef.current = false;
+      setRoiRect(null);
 
       setMessage(
         'All ballooning has been cleared'
@@ -1765,29 +2364,19 @@ export default function DrawingWorkspace() {
 
     setCurrentBalloonNo(String(characteristic.number ?? ''));
 
-    // If DB tolerances are missing / zero, auto-parse from the specification
-    const isZeroOrEmpty = (v) => !v || v === '0.00' || v === '0' || v === '';
-    let plusTol = characteristic.plusTolerance || '';
-    let minusTol = characteristic.minusTolerance || '';
-    let mainVal = characteristic.value || '';
-
-    if (isZeroOrEmpty(plusTol) && isZeroOrEmpty(minusTol) && characteristic.specification) {
-      const parsed = parseSpecificationText(characteristic.specification);
-      if (parsed) {
-        if (parsed.mainValue) mainVal = parsed.mainValue;
-        if (parsed.plusTol)  plusTol  = parsed.plusTol;
-        if (parsed.minusTol) minusTol = parsed.minusTol;
-      }
-    }
+    /* The stored specification is the display text - show it exactly
+       as saved (same as the table). Only value / tolerances are
+       normalised, and only from text that parses confidently. */
+    const normalized = normalizeCallout(characteristic);
 
     setEditData({
       characteristicId: characteristic._id,
       balloonId:        characteristic.balloonId,
       number:           String(characteristic.number ?? ''),
       specification:    characteristic.specification || '',
-      value:            mainVal,
-      plusTolerance:    plusTol,
-      minusTolerance:   minusTol
+      value:            normalized ? normalized.value : (characteristic.value || ''),
+      plusTolerance:    normalized ? normalized.plusTolerance : (characteristic.plusTolerance || ''),
+      minusTolerance:   normalized ? normalized.minusTolerance : (characteristic.minusTolerance || '')
     });
   };
 
@@ -1834,6 +2423,66 @@ export default function DrawingWorkspace() {
     }
   };
 
+  /*
+    A bare symmetric tolerance typed into any panel field
+    ("±0.05") is not a dimension on its own - split it so the
+    value lands in BOTH tolerance boxes.
+  */
+  const extractSymmetricTol = (text) => {
+    const m = String(text ?? '').match(/^\s*±\s*(\d+(?:\.\d+)?)\s*$/);
+    return m ? m[1] : null;
+  };
+
+  /*
+    The value field recomposes the specification on every keystroke,
+    so by the time "±0.05" is complete the old nominal number is gone
+    from editData. Stash it when the field receives focus and put it
+    back when the typed text turns out to be a tolerance. The split
+    happens on Enter/blur only - mutating the box while typing would
+    eat the "±" the user is still typing behind.
+  */
+  const valueNominalStashRef = useRef('');
+  const commitValueField = () => {
+    const symTol = extractSymmetricTol(editData?.value);
+    if (!symTol) {
+      saveEdit();
+      return;
+    }
+    const nominal = valueNominalStashRef.current || '';
+    const nextData = {
+      ...editData,
+      value: nominal,
+      plusTolerance: symTol,
+      minusTolerance: symTol,
+      specification: composeSpecification(nominal, symTol, symTol, '')
+    };
+    setEditData(nextData);
+    setTimeout(() => saveEdit(nextData), 50);
+  };
+
+  /*
+    Same split for the tolerance boxes: "±0.05" typed into either box
+    fills BOTH boxes on Enter/blur.
+  */
+  const commitTolField = (which) => {
+    const raw = which === 'plusTolerance'
+      ? editData?.plusTolerance
+      : editData?.minusTolerance;
+    const symTol = extractSymmetricTol(raw);
+    if (!symTol) {
+      saveEdit();
+      return;
+    }
+    const nextData = {
+      ...editData,
+      plusTolerance: symTol,
+      minusTolerance: symTol,
+      specification: composeSpecification(editData?.value, symTol, symTol, '')
+    };
+    setEditData(nextData);
+    setTimeout(() => saveEdit(nextData), 50);
+  };
+
   const saveEdit = async (overrideData = null) => {
     // If overrideData is a DOM Event (from onBlur), ignore it and use editData
     const dataToSave = (overrideData && overrideData.characteristicId) ? overrideData : editData;
@@ -1848,15 +2497,51 @@ export default function DrawingWorkspace() {
       const number = Number(currentBalloonNo || dataToSave.number);
       setEditData(prev => ({ ...prev, number: String(number) }));
 
+      /* Store the text the user actually typed. Only derive the
+         value / tolerances / limits from it when the specification
+         parses confidently; otherwise save every field verbatim so
+         callouts like "0.5×45°" are never rebuilt from a stale
+         value and lose the extra characters. */
+      const specText =
+        typeof dataToSave.specification === 'string'
+          ? dataToSave.specification
+          : '';
+      const specParts = specText ? parseCalloutText(specText) : null;
+      const specConfident = !!(specParts && specParts.confident);
+      const existing = characteristics.find(
+        (item) => item._id === dataToSave.characteristicId
+      );
+      const normalized = specConfident
+        ? normalizeCallout(
+            {
+              ...dataToSave,
+              specification: specText,
+              type: existing && existing.type
+            },
+            { prefer: 'spec' }
+          )
+        : null;
+
       const updated = await api.put(
         `/characteristics/${dataToSave.characteristicId}`,
-        {
-          number,
-          specification: dataToSave.specification,
-          value: dataToSave.value,
-          plusTolerance: dataToSave.plusTolerance,
-          minusTolerance: dataToSave.minusTolerance
-        }
+        normalized
+          ? {
+              number,
+              specification: specText,
+              value: normalized.value,
+              plusTolerance: normalized.plusTolerance,
+              minusTolerance: normalized.minusTolerance,
+              upperLimit: normalized.upperLimit,
+              lowerLimit: normalized.lowerLimit,
+              type: normalized.type
+            }
+          : {
+              number,
+              specification: specText,
+              value: dataToSave.value ?? '',
+              plusTolerance: dataToSave.plusTolerance ?? '',
+              minusTolerance: dataToSave.minusTolerance ?? ''
+            }
       );
 
       // Keep the balloon number on the drawing in sync
@@ -1893,9 +2578,26 @@ export default function DrawingWorkspace() {
   };
 
   // Populate the edit panel when a balloon is clicked on the drawing
+  const prevSelectedBalloonRef = useRef(null);
+  const isEditPanelFocused = () => {
+    const el = document.activeElement;
+    if (!el || el.tagName !== 'INPUT') return false;
+    const placeholder = el.getAttribute('placeholder');
+    return placeholder === '—' || placeholder === 'Enter balloon number';
+  };
   useEffect(() => {
+    const selectionChanged =
+      prevSelectedBalloonRef.current !== selectedBalloonId;
+    prevSelectedBalloonRef.current = selectedBalloonId;
+
     if (selectedBalloonId) {
-      syncEditFromBalloon(selectedBalloonId);
+      /* Never re-populate the panel while the user is typing in it -
+         every characteristics refresh (e.g. the auto-save fired by
+         blurring another field) would otherwise wipe the text they
+         are in the middle of entering. */
+      if (selectionChanged || !isEditPanelFocused()) {
+        syncEditFromBalloon(selectedBalloonId);
+      }
     } else {
       setCurrentBalloonNo('');
       setEditData(null);
@@ -1903,32 +2605,42 @@ export default function DrawingWorkspace() {
   }, [selectedBalloonId, characteristics]);
 
   const getDisplayValues = (c) => {
-    const isZeroOrEmpty = (v) => !v || v === '0.00' || v === '0' || v === '';
-    let plusTol = c.plusTolerance || '';
-    let minusTol = c.minusTolerance || '';
-    let mainVal = c.value || '';
-    if (isZeroOrEmpty(plusTol) && isZeroOrEmpty(minusTol) && c.specification) {
-      const parsed = parseSpecificationText(c.specification);
-      if (parsed) {
-        if (parsed.mainValue) mainVal = parsed.mainValue;
-        if (parsed.plusTol) plusTol = parsed.plusTol;
-        if (parsed.minusTol) minusTol = parsed.minusTol;
-      }
-    }
-    return { mainVal, plusTol, minusTol };
+    const normalized = normalizeCallout(c);
+    return {
+      /*
+        The stored specification is already the display text -
+        re-normalizing would rebuild it from the bare value and
+        drop quantity / depth wording of stacked notes
+        ("3 x Ø 4.2 12" -> "3 X Ø 4.2").
+      */
+      specification:
+        c.specification ||
+        (normalized && normalized.specification) ||
+        '',
+      mainVal: normalized ? normalized.value : c.value || '',
+      plusTol: normalized
+        ? normalized.plusTolerance
+        : c.plusTolerance || '',
+      minusTol: normalized
+        ? normalized.minusTolerance
+        : c.minusTolerance || ''
+    };
   };
 
   const exportToExcel = () => {
     const data = characteristics
       .slice()
       .sort((a, b) => Number(a.number || 0) - Number(b.number || 0))
-      .map(c => ({
-        'Balloon No': c.number || '',
-        'Description': c.specification || '',
-        'Dimensions No': c.value || '',
-        'Upper Tolerance': c.plusTolerance || '',
-        'Lower Tolerance': c.minusTolerance || ''
-      }));
+      .map(c => {
+        const d = getDisplayValues(c);
+        return {
+          'Balloon No': c.number || '',
+          'Description': d.specification || '',
+          'Dimensions No': d.mainVal || '',
+          'Upper Tolerance': d.plusTol || '',
+          'Lower Tolerance': d.minusTol || ''
+        };
+      });
 
     const worksheet = XLSX.utils.json_to_sheet(data);
     const workbook = XLSX.utils.book_new();
@@ -1957,7 +2669,9 @@ export default function DrawingWorkspace() {
       lastX: event.clientX,
       lastY: event.clientY,
       initialX: event.clientX,
-      initialY: event.clientY
+      initialY: event.clientY,
+      maxDistance: 0,
+      moved: false
     };
 
     event.currentTarget.setPointerCapture?.(
@@ -1974,6 +2688,8 @@ export default function DrawingWorkspace() {
       lastY: event.clientY,
       initialX: event.clientX,
       initialY: event.clientY,
+      maxDistance: 0,
+      moved: false,
       isAnchorDrag: true
     };
     event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -1985,15 +2701,48 @@ export default function DrawingWorkspace() {
     const drag =
       dragBalloonRef.current;
 
-    if (!drag || !canvasRef.current) {
+    if (!drag) {
       return;
     }
 
-    const canvas =
-      canvasRef.current;
+    /*
+      Remember how far the pointer travelled during THIS gesture.
+      The release handler uses it to tell a drag from a click, so
+      that a drag which ends near where it started can no longer be
+      mistaken for a click - and a click is the only thing allowed
+      to re-read (and therefore overwrite) the stored value.
+      Tracked before the view-size guard so a move is never lost.
+    */
+    if (
+      Number.isFinite(event.clientX) &&
+      Number.isFinite(event.clientY)
+    ) {
+      const travelled = Math.hypot(
+        event.clientX - drag.initialX,
+        event.clientY - drag.initialY
+      );
 
-    const dx = event.clientX - drag.lastX;
-    const dy = event.clientY - drag.lastY;
+      if (travelled > drag.maxDistance) {
+        drag.maxDistance = travelled;
+      }
+
+      if (travelled > DRAG_CLICK_THRESHOLD) {
+        drag.moved = true;
+      }
+    }
+
+    if (!viewSize.w || !viewSize.h) {
+      return;
+    }
+
+    /*
+      Positions live in page-relative fractions, so pointer
+      deltas (screen px) are converted against the current
+      on-screen size of the drawing.
+    */
+
+    const dx = (event.clientX - drag.lastX) / viewSize.w;
+    const dy = (event.clientY - drag.lastY) / viewSize.h;
 
     drag.lastX = event.clientX;
     drag.lastY = event.clientY;
@@ -2002,25 +2751,27 @@ export default function DrawingWorkspace() {
       prev.map((balloon) => {
         if (balloon._id !== drag.balloonId) return balloon;
 
+        if (balloon.xRel == null) return balloon;
+
         if (drag.isAnchorDrag) {
-          let newAx = (balloon.anchorX ?? balloon.x + 12) + dx;
-          let newAy = (balloon.anchorY ?? balloon.y + 12) + dy;
-          newAx = Math.max(0, Math.min(canvas.width, newAx));
-          newAy = Math.max(0, Math.min(canvas.height, newAy));
-          return { ...balloon, anchorX: newAx, anchorY: newAy };
-        } else {
-          let newX = balloon.x + dx;
-          let newY = balloon.y + dy;
-          newX = Math.max(0, Math.min(canvas.width, newX));
-          newY = Math.max(0, Math.min(canvas.height, newY));
-          return { ...balloon, x: newX, y: newY };
+          const newAx = clamp01(
+            (balloon.anchorXRel ?? balloon.xRel) + dx
+          );
+          const newAy = clamp01(
+            (balloon.anchorYRel ?? balloon.yRel) + dy
+          );
+          return { ...balloon, anchorXRel: newAx, anchorYRel: newAy };
         }
+
+        const newX = clamp01(balloon.xRel + dx);
+        const newY = clamp01(balloon.yRel + dy);
+        return { ...balloon, xRel: newX, yRel: newY };
       })
     );
   };
 
   const handleBalloonPointerUp =
-    async () => {
+    async (event) => {
       const drag =
         dragBalloonRef.current;
 
@@ -2038,42 +2789,164 @@ export default function DrawingWorkspace() {
 
       if (!balloon) return;
       
-      const movedDistance = Math.hypot(event.clientX - drag.initialX, event.clientY - drag.initialY);
-      if (movedDistance < 5) return; // Didn't actually drag, just clicked
+      /*
+        A gesture only counts as a click when we have the release
+        coordinates AND neither the tracked travel nor the release
+        point exceeded the threshold. Falling back to
+        `event.clientX ?? drag.initialX` used to force the distance
+        to 0 for a pointer-up without coordinates, so a drag was
+        misread as a click and re-ran the detector over a value the
+        user had already corrected.
+      */
+      const hasPointerCoords =
+        Number.isFinite(event?.clientX) &&
+        Number.isFinite(event?.clientY);
 
+      const releaseDistance = hasPointerCoords
+        ? Math.hypot(
+            event.clientX - drag.initialX,
+            event.clientY - drag.initialY
+          )
+        : Infinity;
+
+      const movedDistance = Math.max(
+        Number(drag.maxDistance) || 0,
+        releaseDistance
+      );
+
+      const isClick =
+        hasPointerCoords &&
+        movedDistance < DRAG_CLICK_THRESHOLD &&
+        drag.moved !== true;
+
+      const isAnchorDrag = drag.isAnchorDrag === true;
+
+      const characteristic = characteristics.find(item => item.balloonId === balloon._id);
+      const metrics = canvasMetrics();
+
+      const xRel = balloon.xRel ?? (metrics ? clamp01(balloon.x / metrics.w) : null);
+      const yRel = balloon.yRel ?? (metrics ? clamp01(balloon.y / metrics.h) : null);
+      const anchorXRel =
+        balloon.anchorXRel ??
+        (metrics && balloon.anchorX != null
+          ? clamp01(balloon.anchorX / metrics.w)
+          : null);
+      const anchorYRel =
+        balloon.anchorYRel ??
+        (metrics && balloon.anchorY != null
+          ? clamp01(balloon.anchorY / metrics.h)
+          : null);
+
+      /* ---------------------------------------------------------
+         CLICK (not drag): read dimension at anchor and update
+         --------------------------------------------------------- */
+      if (isClick && !isAnchorDrag && pdfPage) {
+        console.log('[BalloonClick] Reading dimension at anchor:', {
+          balloonId: balloon._id,
+          balloonNumber: balloon.number,
+          anchorX: Math.round(anchorXRel * metrics.w),
+          anchorY: Math.round(anchorYRel * metrics.h)
+        });
+
+        try {
+          const anchorX = anchorXRel * metrics.w;
+          const anchorY = anchorYRel * metrics.h;
+
+          const detected = await readDimensionAtPoint(anchorX, anchorY);
+
+          if (detected) {
+            console.log('[BalloonClick] Dimension detected:', {
+              specification: detected.specification,
+              value: detected.value,
+              plusTolerance: detected.plusTolerance,
+              minusTolerance: detected.minusTolerance,
+              source: detected.source
+            });
+
+            /* Update characteristic in backend */
+            if (characteristic) {
+              const updatedChar = await api.put(`/characteristics/${characteristic._id}`, {
+                specification: detected.specification,
+                value: detected.value,
+                plusTolerance: detected.plusTolerance,
+                minusTolerance: detected.minusTolerance,
+                upperLimit: detected.upperLimit,
+                lowerLimit: detected.lowerLimit,
+                type: detected.type,
+                status: detected.source === 'pdf' ? 'Verified' : 
+                       (detected.source?.startsWith('ocr') && detected.ocrConfidence >= 50 ? 'Verified' : 'Needs verification')
+              });
+
+              if (updatedChar) {
+                setCharacteristics(prev =>
+                  prev.map(item => item._id === characteristic._id ? { ...item, ...updatedChar } : item)
+                );
+              }
+            }
+
+            /* Update balloon text */
+            const updatedBalloon = await api.put(`/balloons/${balloon._id}`, {
+              text: detected.text,
+              type: detected.type,
+              status: detected.source === 'pdf' ? 'Verified' : 
+                     (detected.source?.startsWith('ocr') && detected.ocrConfidence >= 50 ? 'Verified' : 'Needs verification')
+            });
+
+            setBalloons(prev => prev.map(item => item._id === balloon._id ? { ...item, ...updatedBalloon } : item));
+
+            /* Refresh editor panel */
+            syncEditFromBalloon(balloon._id);
+
+            setMessage(`Balloon ${balloon.number}: dimension read as "${detected.specification}"`);
+          } else {
+            setMessage(`Balloon ${balloon.number}: no dimension found at anchor`);
+          }
+        } catch (error) {
+          console.error('[BalloonClick] Dimension read failed:', error);
+          setMessage('Failed to read dimension');
+        }
+        
+        /* Click handled - don't proceed to drag logic */
+        return;
+      }
+
+      /* ---------------------------------------------------------
+         DRAG: save new position
+         --------------------------------------------------------- */
       try {
-        /*
-          When the balloon is dropped onto a
-          measurement, re-read that value from
-          the drawing and auto-fetch it into
-          the characteristic table.
-        */
-
-        
-        // Save the new balloon position without re-fetching or altering the existing dimension value
-        const characteristic = characteristics.find(item => item.balloonId === balloon._id);
-        
         const updatedBalloon = await api.put(`/balloons/${balloon._id}`, {
-          x: balloon.x,
-          y: balloon.y,
-          anchorX: balloon.anchorX,
-          anchorY: balloon.anchorY
+          xRel,
+          yRel,
+          anchorXRel,
+          anchorYRel,
+          x: metrics && xRel != null ? xRel * metrics.w : balloon.x,
+          y: metrics && yRel != null ? yRel * metrics.h : balloon.y,
+          anchorX:
+            metrics && anchorXRel != null
+              ? anchorXRel * metrics.w
+              : balloon.anchorX,
+          anchorY:
+            metrics && anchorYRel != null
+              ? anchorYRel * metrics.h
+              : balloon.anchorY
         });
 
         if (characteristic) {
           await api.put(`/characteristics/${characteristic._id}`, {
-            x: balloon.x,
-            y: balloon.y
+            xRel,
+            yRel,
+            x: metrics && xRel != null ? xRel * metrics.w : characteristic.x,
+            y: metrics && yRel != null ? yRel * metrics.h : characteristic.y
           });
           
           setCharacteristics(prev =>
-            prev.map(item => item._id === characteristic._id ? { ...item, x: balloon.x, y: balloon.y } : item)
+            prev.map(item => item._id === characteristic._id ? { ...item, xRel, yRel } : item)
           );
         }
 
         setBalloons(prev => prev.map(item => item._id === balloon._id ? { ...item, ...updatedBalloon } : item));
         setMessage(`Balloon ${balloon.number} moved`);
-        } catch (error) {
+      } catch (error) {
         console.error(
           'Failed to save balloon position:',
           error
@@ -2085,7 +2958,6 @@ export default function DrawingWorkspace() {
         );
       }
     };
-
   /* =========================================================
      DIMENSION READING (shared by balloon drop + Add Dimension)
      ---------------------------------------------------------
@@ -2138,6 +3010,21 @@ export default function DrawingWorkspace() {
           item.transform?.[5] || 0
         );
 
+      /*
+        Text-space directions in display coordinates - lets the
+        vector-Ø inspector build the slot before a number even when
+        the dimension text is rotated.
+      */
+      const vt = baseViewport.transform;
+      const tr = item.transform || [1, 0, 0, 1, 0, 0];
+
+      const mat = [
+        (vt[0] * tr[0] + vt[2] * tr[1]) * displayScale,
+        (vt[1] * tr[0] + vt[3] * tr[1]) * displayScale,
+        (vt[0] * tr[2] + vt[2] * tr[3]) * displayScale,
+        (vt[1] * tr[2] + vt[3] * tr[3]) * displayScale
+      ];
+
       // Removed region constraints so users can manually balloon anything anywhere
 
       items.push({
@@ -2157,6 +3044,8 @@ export default function DrawingWorkspace() {
           Number(item.height || 0) *
           displayScale,
 
+        mat,
+
         confidence: 1,
 
         source: 'pdf'
@@ -2170,7 +3059,7 @@ export default function DrawingWorkspace() {
     items,
     pointX,
     pointY,
-    maxDistance = 150
+    maxDistance = 150 * dRatio
   ) => {
     let nearest = null;
     let nearestDistance = Infinity;
@@ -2202,6 +3091,266 @@ export default function DrawingWorkspace() {
     return nearest;
   };
 
+  /* =========================================================
+     VECTOR DIAMETER (Ø) INSPECTION
+     ---------------------------------------------------------
+     CAD drawings often draw the Ø glyph as vector art while the
+     number stays as selectable text. These helpers render the
+     page once at high resolution and inspect the pixel slot
+     immediately BEFORE the number:
+
+     - a Ø ring leaves a dense centre (>= 0.145) with no row of
+       ink spanning the slot (maxRow < 0.5)
+     - depth arrows (↧), bars and leader lines fill a whole row
+       and are rejected; empty slots have no centre ink at all
+  ========================================================= */
+
+  const SYMBOL_HAS_RE = /^(SØ|SR|Ø|⌀|∅|R|M)/i;
+
+  const getSymbolRender = async () => {
+    if (!pdfPage) return null;
+
+    const scale = 6;
+    const cached = ocrCacheRef.current;
+
+    if (
+      cached &&
+      cached.page === pdfPage &&
+      cached.scale === scale
+    ) {
+      return cached;
+    }
+
+    const viewport = pdfPage.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+
+    const ctx = canvas.getContext('2d');
+    ctx.filter = 'grayscale(1) contrast(160%) brightness(105%)';
+    await pdfPage.render({ canvasContext: ctx, viewport }).promise;
+
+    const entry = { page: pdfPage, scale, canvas };
+    ocrCacheRef.current = entry;
+    return entry;
+  };
+
+  const detectDiameterSymbol = async (item) => {
+    try {
+      if (!pdfPage || !item || !item.height || !canvasRef.current) {
+        return false;
+      }
+
+      const cachedBefore = !!(
+        ocrCacheRef.current &&
+        ocrCacheRef.current.page === pdfPage &&
+        ocrCacheRef.current.scale === 6
+      );
+      const render = await getSymbolRender();
+      if (!render) return false;
+
+      const baseViewport = pdfPage.getViewport({ scale: 1 });
+      const displayScale =
+        canvasRef.current.width / baseViewport.width;
+      const ratio = render.scale / displayScale;
+
+      const h = item.height;
+      let x1;
+      let y1;
+      let x2;
+      let y2;
+
+      if (item.mat) {
+        const [A, B, C, D] = item.mat;
+        const uxN = Math.hypot(A, B) || 1;
+        const uyN = Math.hypot(C, D) || 1;
+        const ux = [A / uxN, B / uxN];
+        const uy = [C / uyN, D / uyN];
+        const px = [-1.35 * h, -0.12 * h];
+        const qy = [-0.05 * h, 1.05 * h];
+        const xs = [];
+        const ys = [];
+
+        for (const p of px) {
+          for (const q of qy) {
+            xs.push(item.x + p * ux[0] + q * uy[0]);
+            ys.push(item.y + p * ux[1] + q * uy[1]);
+          }
+        }
+
+        x1 = Math.min(...xs);
+        x2 = Math.max(...xs);
+        y1 = Math.min(...ys);
+        y2 = Math.max(...ys);
+      } else {
+        x1 = item.x - 1.35 * h;
+        x2 = item.x - 0.12 * h;
+        y1 = item.y - 1.05 * h;
+        y2 = item.y + 0.05 * h;
+      }
+
+      const sx = x1 * ratio;
+      const sy = y1 * ratio;
+      const sw = (x2 - x1) * ratio;
+      const sh = (y2 - y1) * ratio;
+
+      if (!(sw > 1) || !(sh > 1)) return false;
+
+      const crop = document.createElement('canvas');
+      crop.width = Math.ceil(sw);
+      crop.height = Math.ceil(sh);
+
+      const ctx = crop.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(render.canvas, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
+
+      const data = ctx.getImageData(0, 0, crop.width, crop.height).data;
+      const rowCount = new Array(crop.height).fill(0);
+
+      for (let y = 0; y < crop.height; y++) {
+        for (let x = 0; x < crop.width; x++) {
+          const i = (y * crop.width + x) * 4;
+          const gray =
+            0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          if (gray < 170) rowCount[y]++;
+        }
+      }
+
+      const maxRow = Math.max(...rowCount) / crop.width;
+
+      const cy0 = Math.floor(crop.height * 0.3);
+      const cy1 = Math.ceil(crop.height * 0.7);
+      const cx0 = Math.floor(crop.width * 0.3);
+      const cx1 = Math.ceil(crop.width * 0.7);
+
+      let centerDark = 0;
+      let centerTotal = 0;
+
+      for (let y = cy0; y < cy1; y++) {
+        for (let x = cx0; x < cx1; x++) {
+          const i = (y * crop.width + x) * 4;
+          const gray =
+            0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          centerTotal++;
+          if (gray < 170) centerDark++;
+        }
+      }
+
+      const centerDensity = centerTotal ? centerDark / centerTotal : 0;
+
+      if (typeof window !== 'undefined' && window.__slotDebug) {
+        let totalDark = 0;
+        const totalPx = crop.width * crop.height;
+        for (let y = 0; y < crop.height; y++) {
+          for (let x = 0; x < crop.width; x++) {
+            const i = (y * crop.width + x) * 4;
+            const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+            if (gray < 170) totalDark++;
+          }
+        }
+        console.log(
+          '[diameter-detect] slot',
+          JSON.stringify(item.text), 'pos=', Math.round(item.x) + ',' + Math.round(item.y),
+          'rect=', [x1, y1, x2, y2].map((v) => Math.round(v)).join(','),
+          'crop=', crop.width + 'x' + crop.height,
+          'ctr=', centerDensity.toFixed(3), 'maxRow=', maxRow.toFixed(3),
+          'totalDark=', (totalDark / totalPx).toFixed(3),
+          'cached=', cachedBefore, 'ratio=', ratio.toFixed(2)
+        );
+      }
+
+      return centerDensity >= 0.145 && maxRow < 0.5;
+    } catch (error) {
+      console.warn('[diameter-detect] slot analysis failed:', error);
+      return false;
+    }
+  };
+
+  const attachGeometryDiameter = async (
+    result,
+    items,
+    centerX,
+    centerY
+  ) => {
+    try {
+      if (
+        !result ||
+        SYMBOL_HAS_RE.test(String(result.value || '').trim())
+      ) {
+        return result;
+      }
+
+      const numMatch = String(result.value || '').match(
+        /\d+(?:\.\d+)?/
+      );
+
+      if (!numMatch) return result;
+
+      const num = numMatch[0];
+
+      const candidates = items.filter((it) => {
+        if (it.source && it.source !== 'pdf') return false;
+        if (!it.height || !it.mat) return false;
+        if (DETECTION_PATTERNS.smallTolerance.test(it.text)) return false;
+
+        const m = normalizeDetectionText(it.text).match(
+          /^\s*(\d+(?:\.\d+)?)/
+        );
+
+        return m && Number(m[1]) === Number(num);
+      });
+
+      if (candidates.length === 0) return result;
+
+      candidates.sort(
+        (a, b) =>
+          Math.hypot(
+            detectionCenterX(a) - centerX,
+            detectionCenterY(a) - centerY
+          ) -
+          Math.hypot(
+            detectionCenterX(b) - centerX,
+            detectionCenterY(b) - centerY
+          )
+      );
+
+      const base = candidates[0];
+
+      const distance = Math.hypot(
+        detectionCenterX(base) - centerX,
+        detectionCenterY(base) - centerY
+      );
+
+      if (distance > 120 * dRatio) return result;
+
+      const detected = await detectDiameterSymbol(base);
+
+      if (!detected) return result;
+
+      const merged = normalizeCallout({
+        specification: result.specification,
+        value: result.value,
+        plusTolerance: result.plusTolerance,
+        minusTolerance: result.minusTolerance,
+        type: 'Diameter'
+      });
+
+      if (merged) {
+        console.log(
+          '[diameter-detect] Ø found before',
+          num,
+          '->',
+          merged.value
+        );
+        return { ...result, ...merged };
+      }
+
+      return result;
+    } catch (error) {
+      console.warn('[diameter-detect] failed:', error);
+      return result;
+    }
+  };
+
   const parseNearestDimension = (
     items,
     nearest
@@ -2213,7 +3362,7 @@ export default function DrawingWorkspace() {
     const nearbySymbols = standaloneSymbols.filter(sym => {
       const xDiff = nearest.x - sym.x; 
       const yDiff = Math.abs(nearest.y - sym.y);
-      return xDiff > -20 && xDiff < (nearest.width || 30) * 3 && yDiff < 30;
+      return xDiff > -20 * dRatio && xDiff < (nearest.width || 30 * dRatio) * 3 && yDiff < 30 * dRatio;
     });
     
     if (nearbySymbols.length > 0) {
@@ -2282,6 +3431,30 @@ export default function DrawingWorkspace() {
     }
 
     /*
+      Angle callouts keep the degree symbol in the VALUE.
+
+      normalizeCallout rebuilds the specification from the value
+      text, so a value of "15" would silently drop the "°" that only
+      lives in the raw reading - and the characteristic would store
+      "15" / type Dimension instead of "15°" / type Angle.
+      Covers "15°", "30° ±0.5°" and the note form "ANGLE 30° ±0.5°".
+    */
+    const angleMatch =
+      !plusMinusMatch &&
+      !bilateralMatch &&
+      text.match(
+        /^\s*(?:ANGLE\s+)?(\d+(?:\.\d+)?)\s*°\s*(?:[±]\s*(\d+(?:\.\d+)?)\s*°?)?\s*$/i
+      );
+
+    if (angleMatch) {
+      cleanedValue = `${angleMatch[1]}°`;
+      if (angleMatch[2]) {
+        plusTolerance = angleMatch[2];
+        minusTolerance = angleMatch[2];
+      }
+    }
+
+    /*
       Hole / fit callout such as "25 H7" or "Ø 25 H7/g6".
       Fall back to the first number.
     */
@@ -2291,7 +3464,8 @@ export default function DrawingWorkspace() {
       !bilateralMatch &&
       !diameterMatch &&
       !radiusMatch &&
-      !numericMatch
+      !numericMatch &&
+      !angleMatch
     ) {
       const firstNumber =
         text.match(
@@ -2369,7 +3543,7 @@ export default function DrawingWorkspace() {
         const nearbySymbols = standaloneSymbols.filter(sym => {
           const xDiff = targetItem.x - sym.x; 
           const yDiff = Math.abs(targetItem.y - sym.y);
-          return xDiff > -20 && xDiff < (targetItem.width || 30) * 3 && yDiff < 30;
+          return xDiff > -20 * dRatio && xDiff < (targetItem.width || 30 * dRatio) * 3 && yDiff < 30 * dRatio;
         });
         
         if (nearbySymbols.length > 0) {
@@ -2385,7 +3559,7 @@ export default function DrawingWorkspace() {
 
       if (nearby.length === 1) {
         const toleranceValue =
-          getToleranceNumber(nearby[0].text);
+          getToleranceNumber(nearby[0]);
 
         if (
           Number.isFinite(toleranceValue)
@@ -2400,10 +3574,10 @@ export default function DrawingWorkspace() {
 
       if (nearby.length >= 2) {
         const firstValue =
-          getToleranceNumber(nearby[0].text);
+          getToleranceNumber(nearby[0]);
 
         const secondValue =
-          getToleranceNumber(nearby[1].text);
+          getToleranceNumber(nearby[1]);
 
         if (
           Number.isFinite(firstValue) &&
@@ -2452,6 +3626,8 @@ export default function DrawingWorkspace() {
       type = 'Diameter';
     } else if (/^\s*R\s*\d/.test(text)) {
       type = 'Radius';
+    } else if (/[°]/.test(text)) {
+      type = 'Angle';
     }
 
     let prefix = '';
@@ -2496,6 +3672,43 @@ export default function DrawingWorkspace() {
       }
     }
 
+    /*
+      Rebuild the callout in canonical order - drawings stack the
+      tolerances around the value, so the raw reading order is often
+      "+0.05 7.2 +0.03" instead of "7.2 +0.05 +0.03".
+
+      The raw reading is the source of truth here: value and
+      tolerances were derived from it, so the specification wins
+      whenever it parses confidently. Preferring the value instead
+      would rebuild the text from a bare number and drop the "°"
+      of "15°" (and the "x45° TYP" of a chamfer note).
+    */
+    const normalized = normalizeCallout(
+      {
+        specification,
+        value,
+        plusTolerance,
+        minusTolerance,
+        type
+      },
+      { prefer: 'spec' }
+    );
+
+    if (normalized) {
+      return {
+        text,
+        value: normalized.value,
+        type: normalized.type,
+        plusTolerance: normalized.plusTolerance,
+        minusTolerance: normalized.minusTolerance,
+        upperLimit: normalized.upperLimit,
+        lowerLimit: normalized.lowerLimit,
+        specification: normalized.specification,
+        centerX: detectionCenterX(nearest),
+        centerY: detectionCenterY(nearest)
+      };
+    }
+
     return {
       text,
       value,
@@ -2510,38 +3723,918 @@ export default function DrawingWorkspace() {
     };
   };
 
-  /* Re-read when a balloon is dropped onto a measurement. */
+  /* =========================================================
+     GENERAL DIMENSION READING PIPELINE
+     ---------------------------------------------------------
+     Reusable function: readDimensionAtPoint(anchorX, anchorY, options)
+     Works for ANY drawing, ANY balloon, ANY coordinate.
+     ---------------------------------------------------------
+     1. Search PDF text layer near anchor
+     2. If no valid dimension found, run multi-orientation OCR
+     3. Score all candidates (PDF + OCR normal + OCR CW90 + OCR CCW90)
+     4. Select best candidate by distance, confidence, pattern validity
+     5. Parse using existing dimension parser
+
+     options.rect (Add Dimension drag) focuses the pipeline on the
+     dragged box: the OCR crop covers it, candidates are measured from
+     its edge instead of the anchor point, and a candidate sitting
+     inside it is scored above everything outside. Nothing is thrown
+     away for being outside - a small callout whose OCR box lands just
+     past the operator's edge is still the best reading available.
+     ========================================================= */
 
   const readDimensionAtPoint = async (
-    pointX,
-    pointY
+    anchorX,
+    anchorY,
+    options = {}
   ) => {
+    const {
+      searchRadius = 120 * dRatio,
+      ocrScale = 6,
+      rect = null,
+      /*
+        A dragged selection is the operator pointing straight at a
+        callout, so the per-word confidence floor drops from 30 to 20.
+        Rotated (vertical) readings score lower than horizontal ones,
+        and isReadableCallout still rejects anything that does not
+        parse as a real value - the box then weighs what survived
+        towards the spot the operator actually marked.
+      */
+      minOcrConfidence = rect ? 20 : 30
+    } = options;
+
     if (!pdfPage) {
+      console.log('[DimensionRead] No pdfPage available');
       return null;
     }
 
-    const items =
-      await collectDimensionItems();
+    /*
+      The Add Dimension tool drags a box over a dimension. Everything
+      inside that box is what the operator asked for, so candidates are
+      measured against the BOX (0 while inside, edge distance outside)
+      instead of its centre point - and being inside then adds to the
+      score rather than filtering the pool, so a value whose own text
+      box sits a hair outside the operator's edge is not thrown away.
+    */
+    const box = rect
+      ? {
+          x1: Math.min(rect.x1, rect.x2),
+          y1: Math.min(rect.y1, rect.y2),
+          x2: Math.max(rect.x1, rect.x2),
+          y2: Math.max(rect.y1, rect.y2)
+        }
+      : null;
 
-    if (items.length === 0) {
-      return null;
+    const distanceFrom = (x, y) => {
+      if (!box) {
+        return Math.hypot(x - anchorX, y - anchorY);
+      }
+      const dx = Math.max(box.x1 - x, 0, x - box.x2);
+      const dy = Math.max(box.y1 - y, 0, y - box.y2);
+      return Math.hypot(dx, dy);
+    };
+
+    /* Slack keeps a reading whose OCR box just spills over the
+       dragged edge from being thrown away with the rest. */
+    const boxSlack = 8 * dRatio;
+
+    const insideBox = (x, y) =>
+      !!box &&
+      x >= box.x1 - boxSlack &&
+      x <= box.x2 + boxSlack &&
+      y >= box.y1 - boxSlack &&
+      y <= box.y2 + boxSlack;
+
+    /*
+      Being inside the dragged box is a ranking bonus, NOT a veto.
+
+      The old keepInside() discarded every candidate outside the box as
+      soon as any word sat inside it - and a tight drag over a small
+      callout routinely catches a neighbouring glyph or a dimension-line
+      tick while the value's own OCR box lands just past the edge, so
+      the correct reading was in the OCR output and still thrown away.
+      A valid callout pattern scores 100 against this 40, so a real
+      value just outside the box still beats junk inside it, while the
+      in-box value still beats its neighbours.
+    */
+    const insideBonus = 40;
+
+    const baseViewport = pdfPage.getViewport({ scale: 1 });
+    let displayScale = 1;
+    if (canvasRef.current) {
+      displayScale = canvasRef.current.width / baseViewport.width;
     }
 
-    const nearest = findNearestDimension(
-      items,
-      pointX,
-      pointY,
-      70
+    console.log('[DimensionRead] START', {
+      anchor: { x: Math.round(anchorX), y: Math.round(anchorY) },
+      searchRadius: Math.round(searchRadius),
+      box: box
+        ? {
+            x1: Math.round(box.x1),
+            y1: Math.round(box.y1),
+            x2: Math.round(box.x2),
+            y2: Math.round(box.y2)
+          }
+        : null,
+      displayScale: displayScale.toFixed(2)
+    });
+
+    /*
+      Small callouts ("0.5", "4", stacked tolerances) are only a few
+      points tall, and at the old fixed 3.5 px/pt they landed at ~12 px
+      where Tesseract returns nothing at all or mangles the glyphs.
+      6 px/pt (~432 DPI) puts them back at a readable height; pushing
+      higher is not free - past 8 a plain "79" starts coming back as
+      "7°" - so the density is capped there.  Never below what the
+      screen is showing either, so zooming in still helps.
+    */
+    const ocrRenderScale = Math.min(
+      Math.max(ocrScale, displayScale),
+      6
     );
 
-    if (!nearest) {
+    /* ---------------------------------------------------------
+       STEP 1: PDF TEXT EXTRACTION
+       --------------------------------------------------------- */
+    const pdfItems = await collectDimensionItems();
+    console.log('[DimensionRead] PDF items found:', pdfItems.length);
+
+    const pdfPool = pdfItems
+      .map((item) => {
+        const cx = detectionCenterX(item);
+        const cy = detectionCenterY(item);
+        return {
+          ...item,
+          distance: distanceFrom(cx, cy),
+          inside: insideBox(cx, cy),
+          source: 'pdf'
+        };
+      })
+      .filter((entry) => entry.distance <= searchRadius);
+
+    const pdfCandidates = [...pdfPool].sort(
+      (a, b) => a.distance - b.distance
+    );
+
+    console.log('[DimensionRead] PDF candidates in radius:', pdfCandidates.length);
+
+    let bestCandidate = null;
+    let bestScore = -Infinity;
+    /* Whether the current best sits inside the dragged box. Used to
+       decide whether the any-angle passes still have work to do. */
+    let bestCandidateInside = false;
+
+    /*
+      Best-effort reading: a callout that HAS a number but does not
+      survive parseCalloutText's confidence rules (Tesseract usually
+      mangles stacked tolerances - "C ±0.05" comes back as "Cc £0.05").
+      Kept in a separate pool so the confident candidates' ranking and
+      the box-narrowing behaviour above stay exactly as they were, and
+      used only when nothing confident turned up - so the side panel
+      shows the raw reading flagged 'Needs verification' instead of an
+      empty value the operator has to fill from scratch.
+    */
+    let bestFallback = null;
+    let fallbackScore = -Infinity;
+
+    const hasNumericValue = (parsed) =>
+      /\d/.test(String((parsed && parsed.value) || ''));
+
+    /* Score PDF candidates */
+    for (const candidate of pdfCandidates) {
+      const parsed = parseNearestDimension(pdfItems, candidate);
+      if (!parsed) continue;
+
+      const readable = isReadableCallout(parsed);
+      if (!readable && !hasNumericValue(parsed)) continue;
+
+      const hasValidPattern = isDimensionPattern(parsed.text);
+
+      /*
+        Proximity now decays across the WHOLE search radius instead of
+        stopping at 100px - previously every candidate further away
+        than 100px scored the same, so an unrelated valid dimension
+        nearby could beat the value the user actually clicked on.
+      */
+      const proximity =
+        100 *
+        (1 - Math.min(candidate.distance, searchRadius) / searchRadius);
+
+      const score =
+        (hasValidPattern ? 100 : 0) +
+        proximity +
+        (candidate.inside ? insideBonus : 0);
+
+      if (!readable) {
+        if (score > fallbackScore) {
+          fallbackScore = score;
+          bestFallback = {
+            ...parsed,
+            source: 'pdf',
+            distance: candidate.distance,
+            rawText: candidate.text
+          };
+        }
+        continue;
+      }
+
+      console.log('[DimensionRead] PDF candidate:', {
+        text: parsed.text,
+        spec: parsed.specification,
+        distance: Math.round(candidate.distance),
+        hasValidPattern,
+        score
+      });
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestCandidate = { ...parsed, source: 'pdf', distance: candidate.distance, rawText: candidate.text };
+        bestCandidateInside = candidate.inside;
+      }
+    }
+
+    /* ---------------------------------------------------------
+       STEP 2: MULTI-ORIENTATION OCR (if PDF didn't find strong match)
+       --------------------------------------------------------- */
+    const pdfFoundStrong = bestScore >= 150;
+    
+    if (!pdfFoundStrong) {
+      console.log('[DimensionRead] PDF weak/none, running multi-orientation OCR...');
+
+      const ocrOrientations = [
+        { name: 'normal', rotation: 0 },
+        { name: 'cw90', rotation: Math.PI / 2 },
+        { name: 'ccw90', rotation: -Math.PI / 2 }
+      ];
+
+      const ocrPool = [];
+      const ocrFallbackPool = [];
+
+      /* One sheet render feeds every orientation and the estimate. */
+      let sharedSheet = null;
+      try {
+        sharedSheet = await renderOcrPage(ocrRenderScale);
+      } catch (error) {
+        console.error('[DimensionRead] shared OCR render failed:', error);
+      }
+
+      /* Reads one orientation/window and files everything it saw. */
+      const collectFromOrientation = async (orient) => {
+        const ocrItems = await ocrReadRegionAtPoint(anchorX, anchorY, {
+          searchRadius,
+          ocrScale: ocrRenderScale,
+          rotation: orient.rotation,
+          minConfidence: minOcrConfidence,
+          rect,
+          sharedSheet,
+          oblique: !!orient.oblique,
+          rowBand: !!orient.rowBand
+        });
+
+        console.log(`[DimensionRead] OCR ${orient.name}: ${ocrItems.length} items`);
+
+        for (const item of ocrItems) {
+          const cx = detectionCenterX(item);
+          const cy = detectionCenterY(item);
+          const distance = distanceFrom(cx, cy);
+
+          if (distance > searchRadius) continue;
+
+          const parsed = parseNearestDimension(ocrItems, item);
+          if (!parsed) continue;
+
+          const entry = {
+            parsed,
+            item,
+            orient,
+            distance,
+            inside: insideBox(cx, cy)
+          };
+
+          if (isReadableCallout(parsed)) {
+            ocrPool.push(entry);
+          } else if (hasNumericValue(parsed)) {
+            ocrFallbackPool.push(entry);
+          }
+        }
+      };
+
+      for (const orient of ocrOrientations) {
+        await collectFromOrientation(orient);
+      }
+
+      /*
+        Vertical callouts only show up in the rotated passes, so every
+        readable reading found so far is collected first and the
+        dragged box then weighs the ranking instead of cutting the
+        pool down to whatever happened to land inside it.
+
+        Re-run after every additional (any-angle) pass: the pools only
+        ever grow, so re-scoring raises the winner at worst, never
+        knocks a previous one out.
+      */
+      const scoreOcrPools = (logCandidates) => {
+        for (const entry of ocrPool) {
+          const { parsed, item, orient, distance } = entry;
+
+          const hasValidPattern = isDimensionPattern(parsed.text);
+
+          const ocrConfidence = item.confidence || 0;
+          const orientationBonus = orient.name === 'normal' ? 10 : 0;
+          const proximity =
+            100 * (1 - Math.min(distance, searchRadius) / searchRadius);
+          const score = (hasValidPattern ? 100 : 0) +
+                        (ocrConfidence / 2) +
+                        orientationBonus +
+                        proximity +
+                        (entry.inside ? insideBonus : 0);
+
+          if (logCandidates) {
+            console.log('[DimensionRead] OCR candidate:', {
+              orientation: orient.name,
+              text: parsed.text,
+              spec: parsed.specification,
+              distance: Math.round(distance),
+              confidence: ocrConfidence,
+              hasValidPattern,
+              score
+            });
+          }
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestCandidate = {
+              ...parsed,
+              source: `ocr-${orient.name}`,
+              distance,
+              rawText: item.text,
+              ocrConfidence
+            };
+            bestCandidateInside = entry.inside;
+          }
+        }
+
+        /*
+          Second pass over the readings that carry a number but would
+          not parse confidently. Same ranking and the same box
+          weighting, but they can only ever fill the gap when the
+          confident pool came up empty.
+        */
+        for (const entry of ocrFallbackPool) {
+          const { parsed, item, orient, distance } = entry;
+
+          const hasValidPattern = isDimensionPattern(parsed.text);
+          const ocrConfidence = item.confidence || 0;
+          const orientationBonus = orient.name === 'normal' ? 10 : 0;
+          const proximity =
+            100 * (1 - Math.min(distance, searchRadius) / searchRadius);
+          const score = (hasValidPattern ? 100 : 0) +
+                        (ocrConfidence / 2) +
+                        orientationBonus +
+                        proximity +
+                        (entry.inside ? insideBonus : 0);
+
+          if (score > fallbackScore) {
+            fallbackScore = score;
+            bestFallback = {
+              ...parsed,
+              source: `ocr-${orient.name}`,
+              distance,
+              rawText: item.text,
+              ocrConfidence
+            };
+          }
+        }
+      };
+
+      scoreOcrPools(true);
+
+      const confidentFound = () =>
+        bestScore >= 150 && (!box || bestCandidateInside);
+
+      /*
+        ANY-ANGLE PASSES
+        ---------------------------------------------------------
+        A callout written on a diagonal leader is invisible to 0° and
+        ±90°: Tesseract only reads near-horizontal text, so those
+        three passes return noise and the operator gets a blank (or a
+        neighbour's value) for a perfectly legible dimension.
+
+        Only started when the standard passes have nothing confident
+        INSIDE the dragged box, so a normal read costs nothing extra.
+        A 5 degree grid walked from 45 outwards - drawing callouts
+        cluster around the 30-60 diagonal, and at 5 degree steps no
+        callout can sit more than 2.5 degrees off the angle being
+        read, inside Tesseract's window. Estimating the angle from
+        the bitmap first was tried and dropped: a page frame or a
+        chamfer edge scores higher than the glyphs it crosses, so the
+        estimate missed by 7-85 degrees while the grid never missed
+        by more than 2.5.
+
+        Each angle is read twice at most: the window as cropped, and
+        - only if that came back as noise - the same window with
+        everything outside its glyph rows blanked, because a leader
+        line riding along in the crop is enough to make Tesseract
+        read the graphics instead of the value. Scoring stops the
+        whole thing the moment something confident lands in the box.
+      */
+      if (!confidentFound()) {
+        console.log('[DimensionRead] no confident reading at 0/90 - trying callout angles...');
+
+        const toRad = (deg) => (deg * Math.PI) / 180;
+
+        const sweep = [];
+        for (let deg = 5; deg <= 85; deg += 5) {
+          if (deg % 90 === 0) continue;
+          sweep.push(toRad(deg), toRad(-deg));
+        }
+        sweep.sort(
+          (a, b) =>
+            Math.min(Math.abs(a - toRad(45)), Math.abs(a + toRad(45))) -
+            Math.min(Math.abs(b - toRad(45)), Math.abs(b + toRad(45)))
+        );
+
+        let passes = 0;
+        for (const rotation of sweep) {
+          if (passes >= 12) break;
+          passes += 1;
+          const degrees = Math.round((rotation * 180) / Math.PI);
+          await collectFromOrientation({
+            name: `obl${degrees}`,
+            rotation,
+            oblique: true
+          });
+          scoreOcrPools(false);
+
+          if (!confidentFound()) {
+            await collectFromOrientation({
+              name: `obl${degrees}b`,
+              rotation,
+              oblique: true,
+              rowBand: true
+            });
+            scoreOcrPools(false);
+          }
+
+          if (confidentFound()) {
+            console.log('[DimensionRead] any-angle pass succeeded:', {
+              angle: degrees,
+              score: Math.round(bestScore)
+            });
+            break;
+          }
+        }
+
+        if (!confidentFound()) {
+          console.log('[DimensionRead] any-angle passes exhausted:', {
+            passes,
+            bestScore: Math.round(bestScore)
+          });
+        }
+      }
+    }
+
+    /*
+      Nothing parsed cleanly, but something numeric was read at the
+      spot the operator marked - hand that over flagged, rather than
+      leaving the characteristic blank.
+    */
+    if (!bestCandidate && bestFallback) {
+      console.log('[DimensionRead] BEST-EFFORT (not confident):', {
+        source: bestFallback.source,
+        text: bestFallback.text,
+        value: bestFallback.value,
+        specification: bestFallback.specification,
+        distance: Math.round(bestFallback.distance || 0),
+        score: Math.round(fallbackScore)
+      });
+      bestCandidate = { ...bestFallback, needsVerification: true };
+    }
+
+    if (!bestCandidate) {
+      console.log('[DimensionRead] NO VALID CANDIDATE FOUND');
       return null;
     }
 
-    return parseNearestDimension(
-      items,
-      nearest
+    console.log('[DimensionRead] SELECTED:', {
+      source: bestCandidate.source,
+      text: bestCandidate.text,
+      specification: bestCandidate.specification,
+      value: bestCandidate.value,
+      plusTolerance: bestCandidate.plusTolerance,
+      minusTolerance: bestCandidate.minusTolerance,
+      distance: Math.round(bestCandidate.distance),
+      score: Math.round(bestScore),
+      needsVerification: !!bestCandidate.needsVerification
+    });
+
+    /* Attach geometry diameter (vector Ø detection) */
+    const allItems = [...pdfItems];
+    const result = await attachGeometryDiameter(
+      bestCandidate,
+      allItems,
+      anchorX,
+      anchorY
     );
+
+    return result;
+  };
+
+  /* ---------------------------------------------------------
+     One rasterisation of the sheet, shared by every OCR pass.
+     ---------------------------------------------------------
+     readDimensionAtPoint recognises the same window three times
+     (normal / cw90 / ccw90), and it used to re-render the whole
+     page for each one - at 6 px/pt that is an 18 MP canvas per
+     rotation for identical pixels. Render once, crop three times.
+     --------------------------------------------------------- */
+  const renderOcrPage = async (scale) => {
+    const viewport = pdfPage.getViewport({ scale });
+    const sheet = document.createElement('canvas');
+    sheet.width = Math.ceil(viewport.width);
+    sheet.height = Math.ceil(viewport.height);
+
+    const ctx = sheet.getContext('2d');
+    ctx.filter = 'grayscale(1) contrast(160%) brightness(105%)';
+    await pdfPage.render({ canvasContext: ctx, viewport }).promise;
+
+    return sheet;
+  };
+
+  /* ---------------------------------------------------------
+     Danish OCR worker - the Ø reader.
+     ---------------------------------------------------------
+     Tesseract's English model has no Ø glyph at all: fed a clean
+     "Ø6 Ø20 R10" it answers "Bk B20 A4 RID", so on a scanned
+     drawing the diameter symbol is replaced by whatever the glyph
+     most resembles (2, 3, 4, 0 ...) and a Ø callout is stored as a
+     plain - and wrong - number. Danish ships Ø as an ordinary
+     letter and returns "Ø6" for the same bitmap, so reads that
+     carry the glyph are taken from it. Falls back to English-only
+     when the model cannot be loaded.
+  --------------------------------------------------------- */
+  const getDanWorker = async () => {
+    if (ocrDanUnavailableRef.current) return null;
+    if (ocrDanWorkerRef.current) return ocrDanWorkerRef.current;
+
+    try {
+      ocrDanWorkerRef.current = await createWorker('dan', 1, {
+        workerPath: '/tesseract/worker.min.js',
+        corePath: '/tesseract/tesseract-core.wasm.js',
+        langPath: '/tesseract'
+      });
+      return ocrDanWorkerRef.current;
+    } catch (error) {
+      ocrDanUnavailableRef.current = true;
+      console.warn(
+        '[DimensionRead] Ø model unavailable, English OCR only:',
+        error && error.message
+      );
+      return null;
+    }
+  };
+
+  /* ---------------------------------------------------------
+     OCR at specific point with rotation support
+     --------------------------------------------------------- */
+  const ocrReadRegionAtPoint = async (anchorX, anchorY, options) => {
+    const {
+      searchRadius = 120 * dRatio,
+      ocrScale = 6,
+      rotation = 0,
+      minConfidence = 30,
+      rect = null,
+      sharedSheet = null,
+      /*
+        Oblique (any-angle) passes crop to the dragged box alone, with
+        a little bleed: a second window around the anchor would only
+        add page frame and neighbouring callouts to a pass whose whole
+        job is reading one diagonal callout - slower and worse.
+
+        rowBand drops everything outside the rows that hold glyphs
+        before the read - a retry used when the same window read as
+        noise (see maskTextBand).
+      */
+      oblique = false,
+      rowBand = false
+    } = options;
+
+    if (!pdfPage) return [];
+
+    try {
+      const baseViewport = pdfPage.getViewport({ scale: 1 });
+      let displayScale = 1;
+      if (canvasRef.current) {
+        displayScale = canvasRef.current.width / baseViewport.width;
+      }
+
+      /* Match or exceed what is on screen, but keep the render
+         bounded so heavy zoom does not stall the OCR pass. */
+      const scale = Math.min(Math.max(ocrScale, displayScale), 6);
+
+      const fullCanvas = sharedSheet || (await renderOcrPage(scale));
+
+      const ratio = scale / displayScale;
+      const margin = 10 * dRatio;
+
+      /*
+        A dragged selection crops to that box (plus a little bleed) so
+        Tesseract sees the value the operator marked instead of the
+        neighbouring dimensions. The box is always UNIONED with the
+        usual square around the anchor, so a plain click keeps the old
+        window and never loses the tolerance lines stacked below a
+        value. Point-only reads behave exactly as before.
+
+        sx / sy are the true source origin of the crop, so the box
+        mapping below stays correct even when a clamped window starts
+        at 0.
+      */
+      let cropLeft = anchorX - searchRadius - margin;
+      let cropTop = anchorY - searchRadius - margin;
+      let cropWidth = searchRadius * 2;
+      let cropHeight = searchRadius * 2;
+
+      if (rect && oblique) {
+        const bleed = 30 * dRatio;
+        cropLeft = Math.min(rect.x1, rect.x2) - bleed;
+        cropTop = Math.min(rect.y1, rect.y2) - bleed;
+        cropWidth = Math.abs(rect.x1 - rect.x2) + bleed * 2;
+        cropHeight = Math.abs(rect.y1 - rect.y2) + bleed * 2;
+      } else if (rect) {
+        const anchorLeft = anchorX - searchRadius - margin;
+        const anchorTop = anchorY - searchRadius - margin;
+        const anchorRight = anchorX + searchRadius + margin;
+        const anchorBottom = anchorY + searchRadius + margin;
+
+        const rx1 = Math.min(rect.x1, rect.x2) - margin;
+        const ry1 = Math.min(rect.y1, rect.y2) - margin;
+        const rx2 = Math.max(rect.x1, rect.x2) + margin;
+        const ry2 = Math.max(rect.y1, rect.y2) + margin;
+
+        cropLeft = Math.min(anchorLeft, rx1);
+        cropTop = Math.min(anchorTop, ry1);
+        cropWidth = Math.max(anchorRight, rx2) - cropLeft;
+        cropHeight = Math.max(anchorBottom, ry2) - cropTop;
+      }
+
+      /*
+        Bound the pass: a box dragged across the whole sheet would
+        otherwise feed a page-sized bitmap to Tesseract at full
+        density and stall the UI. Centre the cap on the anchor, which
+        is where the value the user marked lives.
+      */
+      const maxCrop = 900 * dRatio;
+
+      if (cropWidth > maxCrop) {
+        cropLeft = anchorX - maxCrop / 2;
+        cropWidth = maxCrop;
+      }
+
+      if (cropHeight > maxCrop) {
+        cropTop = anchorY - maxCrop / 2;
+        cropHeight = maxCrop;
+      }
+
+      let sx = cropLeft * ratio;
+      let sy = cropTop * ratio;
+      let sw = cropWidth * ratio;
+      let sh = cropHeight * ratio;
+
+      if (sx < 0) {
+        sw += sx;
+        sx = 0;
+      }
+      if (sy < 0) {
+        sh += sy;
+        sy = 0;
+      }
+
+      sw = Math.min(sw, fullCanvas.width - sx);
+      sh = Math.min(sh, fullCanvas.height - sy);
+
+      if (sw <= 1 || sh <= 1) return [];
+
+      let crop = document.createElement('canvas');
+      crop.width = Math.ceil(sw);
+      crop.height = Math.ceil(sh);
+      const cropCtx = crop.getContext('2d');
+      cropCtx.drawImage(fullCanvas, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
+
+      /* Kept for the inverse mapping: the window before rotation. */
+      const cropW0 = crop.width;
+      const cropH0 = crop.height;
+
+      /*
+        Apply rotation if needed.
+
+        The canvas is grown to the rotated bounding box so a diagonal
+        callout is never clipped, and the rotation happens about the
+        centre - which is what the inverse mapping below assumes. For
+        ±90 the bounding box is simply the swapped width/height, so
+        the existing right-angle behaviour is unchanged.
+      */
+      if (rotation !== 0) {
+        const rightAngle =
+          Math.abs(Math.abs(rotation) - Math.PI / 2) < 1e-9;
+        const absCos = Math.abs(Math.cos(rotation));
+        const absSin = Math.abs(Math.sin(rotation));
+        const rotCanvas = document.createElement('canvas');
+        /* Exact swap at ±90: ceil() would round 995.0000000000001
+           up to 996 and shift every rotated reading by half a pixel. */
+        rotCanvas.width = rightAngle
+          ? crop.height
+          : Math.ceil(crop.width * absCos + crop.height * absSin);
+        rotCanvas.height = rightAngle
+          ? crop.width
+          : Math.ceil(crop.width * absSin + crop.height * absCos);
+        const rctx = rotCanvas.getContext('2d');
+        /* Corners outside the rotated window would otherwise stay
+           transparent, which Tesseract reads as black. */
+        rctx.fillStyle = '#ffffff';
+        rctx.fillRect(0, 0, rotCanvas.width, rotCanvas.height);
+        rctx.translate(rotCanvas.width / 2, rotCanvas.height / 2);
+        rctx.rotate(rotation);
+        rctx.drawImage(crop, -crop.width / 2, -crop.height / 2);
+        crop = rotCanvas;
+      }
+
+      /*
+        A row-band retry that finds no glyph rows has nothing left to
+        read - skip it instead of paying for the same noise twice.
+      */
+      if (rowBand && !maskTextBand(crop)) return [];
+
+      if (!ocrWorkerRef.current) {
+        ocrWorkerRef.current = await createWorker('eng', 1, { 
+          workerPath: '/tesseract/worker.min.js', 
+          corePath: '/tesseract/tesseract-core.wasm.js', 
+          langPath: '/tesseract' 
+        });
+      }
+
+      /*
+        The same bitmap goes to both models at once. English still
+        owns every glyph it can read (tolerance stacks, "R10", plain
+        numbers), while Danish contributes ONLY the words that carry
+        Ø - otherwise its weaker reading of everything else would
+        compete with the English one. A Danish Ø word that overlaps
+        an English word replaces it, so one callout is never scored
+        twice: once as "Ø6" and once as the English substitute "26".
+      */
+      const danWorker = await getDanWorker();
+      const [engResult, danResult] = await Promise.all([
+        ocrWorkerRef.current.recognize(crop, {}, { blocks: true }),
+        danWorker
+          ? danWorker
+              .recognize(crop, {}, { blocks: true })
+              .catch((error) => {
+                console.warn('[DimensionRead] Ø pass failed:', error && error.message);
+                return null;
+              })
+          : Promise.resolve(null)
+      ]);
+
+      const words = extractOcrWords(engResult.data);
+      const danWords = danResult ? extractOcrWords(danResult.data) : [];
+
+      const mapWordToItem = (word) => {
+        if (!word.text || !word.text.trim()) return null;
+
+        let text = normalizeDetectionText(word.text)
+          .replace(/O(?=\d)/gi, 'Ø')
+          .replace(/^0(?=\d)/, 'Ø');
+
+        if (!isDetectionText(text, { allowLongNumbers: !!rect })) return null;
+        if (Number(word.confidence || 0) < minConfidence) return null;
+
+        const wx = word.bbox?.x0 || 0;
+        const wy = word.bbox?.y0 || 0;
+        const ww = (word.bbox?.x1 - word.bbox?.x0) || 0;
+        const wh = (word.bbox?.y1 - word.bbox?.y0) || 0;
+
+        /*
+          Map the OCR box back to drawing space.
+
+          `crop` was re-assigned to the rotated canvas, so its
+          width/height are the rotated window's - the pre-rotation
+          size lives in cropW0/cropH0. Inverting rotate(+90) /
+          rotate(-90) therefore looks like this:
+            +90 : x = wy,              y = cropH0 - wx - ww
+            -90 : x = cropW0 - wy - wh, y = wx
+          (the two branches used to be swapped, which mirrored every
+          rotated reading and threw the balloon to the wrong spot).
+
+          Any other angle is inverted the same way: the point is taken
+          relative to the rotated canvas centre, rotated back by
+          -rotation, and put back relative to the original centre.
+          The four corners are mapped and their bounding box used, so
+          a diagonal word keeps a box that contains it.
+        */
+        let origX, origY, origW, origH;
+        if (rotation === Math.PI / 2) {
+          origX = sx / ratio + wy / ratio;
+          origY = sy / ratio + (crop.width - wx - ww) / ratio;
+          origW = wh / ratio;
+          origH = ww / ratio;
+        } else if (rotation === -Math.PI / 2) {
+          origX = sx / ratio + (crop.height - wy - wh) / ratio;
+          origY = sy / ratio + wx / ratio;
+          origW = wh / ratio;
+          origH = ww / ratio;
+        } else if (rotation !== 0) {
+          const cos = Math.cos(rotation);
+          const sin = Math.sin(rotation);
+          const rx = crop.width / 2;
+          const ry = crop.height / 2;
+          const cx0 = cropW0 / 2;
+          const cy0 = cropH0 / 2;
+          const toOriginal = (X, Y) => {
+            const u = X - rx;
+            const v = Y - ry;
+            return [cx0 + u * cos + v * sin, cy0 - u * sin + v * cos];
+          };
+          const corners = [
+            toOriginal(wx, wy),
+            toOriginal(wx + ww, wy),
+            toOriginal(wx, wy + wh),
+            toOriginal(wx + ww, wy + wh)
+          ];
+          let minX = Infinity;
+          let maxX = -Infinity;
+          let minY = Infinity;
+          let maxY = -Infinity;
+          for (const [px, py] of corners) {
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+          }
+          origX = sx / ratio + minX / ratio;
+          origY = sy / ratio + minY / ratio;
+          origW = (maxX - minX) / ratio;
+          origH = (maxY - minY) / ratio;
+        } else {
+          // Normal
+          origX = sx / ratio + wx / ratio;
+          origY = sy / ratio + wy / ratio;
+          origW = ww / ratio;
+          origH = wh / ratio;
+        }
+
+        return {
+          text,
+          x: origX,
+          y: origY,
+          width: origW,
+          height: origH,
+          confidence: Number(word.confidence || 0),
+          source: 'ocr'
+        };
+      };
+
+      const items = [];
+      for (const word of words) {
+        const item = mapWordToItem(word);
+        if (item) items.push(item);
+      }
+
+      /* Share of the smaller box that the two readings cover. */
+      const boxOverlap = (a, b) => {
+        const w =
+          Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+        const h =
+          Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+        if (w <= 0 || h <= 0) return 0;
+        const smaller = Math.min(
+          a.width * a.height,
+          b.width * b.height
+        );
+        return smaller > 0 ? (w * h) / smaller : 0;
+      };
+
+      for (const word of danWords) {
+        if (!word.text || !/[Øø⌀∅]/.test(word.text)) continue;
+        if (!/\d/.test(word.text)) continue;
+
+        const item = mapWordToItem(word);
+        if (!item) continue;
+
+        for (let i = items.length - 1; i >= 0; i--) {
+          if (boxOverlap(item, items[i]) >= 0.4) items.splice(i, 1);
+        }
+        items.push(item);
+      }
+
+      return items;
+    } catch (error) {
+      console.error('[DimensionRead] OCR region failed:', error);
+      return [];
+    }
+  };
+
+  /* Re-read when a balloon is dropped onto a measurement (legacy wrapper). */
+  const readDimensionAtPointLegacy = async (pointX, pointY) => {
+    return readDimensionAtPoint(pointX, pointY);
   };
 
   /* OCR fallback for scanned drawings without a text layer. */
@@ -2567,6 +4660,100 @@ const extractOcrWords = (data) => {
   return words;
 };
 
+/*
+  Blank every row outside the band that actually holds glyphs.
+
+  Rotating a diagonal callout upright is only half the job: Tesseract
+  still has to choose ONE text line out of the picture, and the leader
+  line, the dash pattern and the sheet edges that rode along in the
+  crop compete with it - the engine locks onto that graphics cluster
+  instead and a perfectly legible value comes back as "Ne". A row of
+  glyphs carries several short dark runs; a row crossed by a single
+  line carries one. Score the rows that way, keep the best cluster
+  (padded so no descender is clipped) and white out the rest: the
+  canvas keeps its size, so every box mapping downstream is untouched.
+*/
+const maskTextBand = (canvas) => {
+  const w = canvas.width;
+  const h = canvas.height;
+  if (w < 8 || h < 8) return false;
+
+  const ctx = canvas.getContext('2d');
+  const { data } = ctx.getImageData(0, 0, w, h);
+  const maxRun = Math.round(w * 0.3);
+  const shortRuns = new Array(h);
+
+  for (let y = 0; y < h; y++) {
+    let count = 0;
+    let x = 0;
+    while (x < w) {
+      if (data[(y * w + x) * 4] < 160) {
+        const start = x;
+        while (x < w && data[(y * w + x) * 4] < 160) x += 1;
+        if (x - start <= maxRun) count += 1;
+      } else {
+        x += 1;
+      }
+    }
+    shortRuns[y] = count;
+  }
+
+  /* Smooth over 5 rows so a single stroke gap does not split a line. */
+  const smoothed = new Array(h);
+  for (let y = 0; y < h; y++) {
+    let sum = 0;
+    let count = 0;
+    for (let k = y - 2; k <= y + 2; k++) {
+      if (k < 0 || k >= h) continue;
+      sum += shortRuns[k];
+      count += 1;
+    }
+    smoothed[y] = count ? sum / count : 0;
+  }
+
+  const rows = [];
+  for (let y = 0; y < h; y++) if (smoothed[y] >= 3) rows.push(y);
+  if (!rows.length) return false;
+
+  const segments = [];
+  let start = rows[0];
+  let prev = rows[0];
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i] - prev > 20) {
+      segments.push([start, prev]);
+      start = rows[i];
+    }
+    prev = rows[i];
+  }
+  segments.push([start, prev]);
+
+  const scored = segments.map(([top, bottom]) => {
+    const height = bottom - top + 1;
+    let sum = 0;
+    for (let y = top; y <= bottom; y++) sum += shortRuns[y];
+    return { top, bottom, height, sum };
+  });
+  /* A band taller than most of the window is a page, not a text line. */
+  const plausible = scored.filter((s) => s.height <= h * 0.6);
+  const pool = plausible.length ? plausible : scored;
+  pool.sort((a, b) => b.sum - a.sum);
+
+  const best = pool[0];
+  const pad = Math.max(8, Math.round(best.height * 0.35));
+  const top = Math.max(0, best.top - pad);
+  const bottom = Math.min(h - 1, best.bottom + pad);
+
+  /* A sliver, or the whole window: masking would only cost a second
+     recognition of the same picture. */
+  if (bottom - top + 1 < 12) return false;
+  if (top === 0 && bottom === h - 1) return false;
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, w, top);
+  ctx.fillRect(0, bottom + 1, w, h - bottom - 1);
+  return true;
+};
+
   const ocrReadRegion = async (rect) => {
     if (!pdfPage) {
       return [];
@@ -2586,7 +4773,7 @@ const extractOcrWords = (data) => {
           baseViewport.width;
       }
 
-      const ocrScale = 3.5;
+      const ocrScale = Math.min(Math.max(3.5, displayScale), 6);
 
       const viewport =
         pdfPage.getViewport({
@@ -2613,7 +4800,7 @@ const extractOcrWords = (data) => {
         viewport
       }).promise;
 
-      const margin = 10;
+      const margin = 10 * dRatio;
       const ratio = ocrScale / displayScale;
 
       const sx =
@@ -2657,61 +4844,247 @@ const extractOcrWords = (data) => {
       if (!ocrWorkerRef.current) {
         ocrWorkerRef.current = await createWorker('eng', 1, { workerPath: '/tesseract/worker.min.js', corePath: '/tesseract/tesseract-core.wasm.js', langPath: '/tesseract' });
       }
-      let { data } = await ocrWorkerRef.current.recognize(crop, {}, { blocks: true });
+
+      /*
+        Same two-model read as the manual path: English for every glyph
+        it can name, Danish only for the words carrying Ø (the English
+        alphabet has no such letter), with an overlapping Danish word
+        replacing the English substitute for the same callout.
+      */
+      const danWorker = await getDanWorker();
+      const [engResult, danResult] = await Promise.all([
+        ocrWorkerRef.current.recognize(crop, {}, { blocks: true }),
+        danWorker
+          ? danWorker.recognize(crop, {}, { blocks: true }).catch(() => null)
+          : Promise.resolve(null)
+      ]);
+
+      let { data } = engResult;
       words = extractOcrWords(data).map(w => ({
         text: w.text,
         bbox: { x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 },
         confidence: w.confidence
       }));
 
-      const hasValidText = words.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, '�').replace(/^0(?=\d)/, '�')));
-      if (!hasValidText && words.length <= 2) {
-        // Try counter-clockwise rotation (bottom-to-top text)
-        const rotCanvas = document.createElement('canvas');
-        rotCanvas.width = crop.height;
-        rotCanvas.height = crop.width;
-        const rctx = rotCanvas.getContext('2d');
-        rctx.translate(rotCanvas.width / 2, rotCanvas.height / 2);
-        rctx.rotate(-Math.PI / 2);
-        rctx.drawImage(crop, -crop.width / 2, -crop.height / 2);
-        
-        const { data: rotData } = await ocrWorkerRef.current.recognize(rotCanvas, {}, { blocks: true });
-        const rotWords = extractOcrWords(rotData).map(w => ({
-          text: w.text,
-          bbox: {
-            x0: crop.width - w.bbox.y1,
-            y0: w.bbox.x0,
-            x1: crop.width - w.bbox.y0,
-            y1: w.bbox.x1
-          },
-          confidence: w.confidence
-        }));
-        
-        if (rotWords.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, '�').replace(/^0(?=\d)/, '�')))) {
-          words = rotWords;
-        } else {
-          // Try clockwise rotation (top-to-bottom text)
-          const rotCanvas2 = document.createElement('canvas');
-          rotCanvas2.width = crop.height;
-          rotCanvas2.height = crop.width;
-          const rctx2 = rotCanvas2.getContext('2d');
-          rctx2.translate(rotCanvas2.width / 2, rotCanvas2.height / 2);
-          rctx2.rotate(Math.PI / 2);
-          rctx2.drawImage(crop, -crop.width / 2, -crop.height / 2);
-          
-          const { data: rotData2 } = await ocrWorkerRef.current.recognize(rotCanvas2, {}, { blocks: true });
-          const rotWords2 = extractOcrWords(rotData2).map(w => ({
+      if (danResult) {
+        const oBoxOverlap = (a, b) => {
+          const w = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+          const h = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+          if (w <= 0 || h <= 0) return 0;
+          const smaller = Math.min(
+            (a.x1 - a.x0) * (a.y1 - a.y0),
+            (b.x1 - b.x0) * (b.y1 - b.y0)
+          );
+          return smaller > 0 ? (w * h) / smaller : 0;
+        };
+
+        for (const w of extractOcrWords(danResult.data)) {
+          if (!w.text || !/[Øø⌀∅]/.test(w.text)) continue;
+          if (!/\d/.test(w.text)) continue;
+          if (Number(w.confidence || 0) < 30) continue;
+
+          const box = {
+            x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1
+          };
+          for (let i = words.length - 1; i >= 0; i--) {
+            if (oBoxOverlap(box, words[i].bbox) >= 0.4) words.splice(i, 1);
+          }
+          words.push({ text: w.text, bbox: box, confidence: w.confidence });
+        }
+      }
+
+      /* Words that read as a dimension once O -> Ø is repaired. */
+      const readableWords = (ws) =>
+        ws.some((w) =>
+          isDetectionText(
+            normalizeDetectionText(w.text)
+              .replace(/O(?=\d)/gi, 'Ø')
+              .replace(/^0(?=\d)/, 'Ø')
+          )
+        );
+
+      /*
+        One pass at a given rotation: rotate the window (grown to the
+        rotated bounding box so a diagonal callout is never clipped),
+        optionally keep only the rows holding glyphs (rowBand - a
+        retry for windows whose leader lines crowd out the value),
+        read it with both models, and map every word box back into
+        crop coordinates - the same inverse the manual path uses, so
+        ±90 lands on exactly the boxes it always did.
+      */
+      const readAtAngle = async (rotation, rowBand = false) => {
+        let source = crop;
+
+        if (rotation !== 0) {
+          const rightAngle =
+            Math.abs(Math.abs(rotation) - Math.PI / 2) < 1e-9;
+          const absCos = Math.abs(Math.cos(rotation));
+          const absSin = Math.abs(Math.sin(rotation));
+          const rotCanvas = document.createElement('canvas');
+          rotCanvas.width = rightAngle
+            ? crop.height
+            : Math.ceil(crop.width * absCos + crop.height * absSin);
+          rotCanvas.height = rightAngle
+            ? crop.width
+            : Math.ceil(crop.width * absSin + crop.height * absCos);
+          const rctx = rotCanvas.getContext('2d');
+          rctx.fillStyle = '#ffffff';
+          rctx.fillRect(0, 0, rotCanvas.width, rotCanvas.height);
+          rctx.translate(rotCanvas.width / 2, rotCanvas.height / 2);
+          rctx.rotate(rotation);
+          rctx.drawImage(crop, -crop.width / 2, -crop.height / 2);
+          source = rotCanvas;
+        }
+
+        if (rowBand) {
+          /* Never mask the shared crop in place - at rotation 0 that
+             canvas is the window every other pass still reads. */
+          const banded = document.createElement('canvas');
+          banded.width = source.width;
+          banded.height = source.height;
+          banded.getContext('2d').drawImage(source, 0, 0);
+          if (!maskTextBand(banded)) return [];
+          source = banded;
+        }
+
+        const danModel = await getDanWorker();
+        const [engRes, danRes] = await Promise.all([
+          ocrWorkerRef.current.recognize(source, {}, { blocks: true }),
+          danModel
+            ? danModel
+                .recognize(source, {}, { blocks: true })
+                .catch(() => null)
+            : Promise.resolve(null)
+        ]);
+
+        const backToCrop = (w) => {
+          if (rotation === 0) {
+            return {
+              x0: w.bbox.x0,
+              y0: w.bbox.y0,
+              x1: w.bbox.x1,
+              y1: w.bbox.y1
+            };
+          }
+          const cos = Math.cos(rotation);
+          const sin = Math.sin(rotation);
+          const rx = source.width / 2;
+          const ry = source.height / 2;
+          const cx0 = crop.width / 2;
+          const cy0 = crop.height / 2;
+          const corners = [
+            [w.bbox.x0, w.bbox.y0],
+            [w.bbox.x1, w.bbox.y0],
+            [w.bbox.x0, w.bbox.y1],
+            [w.bbox.x1, w.bbox.y1]
+          ].map(([X, Y]) => {
+            const u = X - rx;
+            const v = Y - ry;
+            return [cx0 + u * cos + v * sin, cy0 - u * sin + v * cos];
+          });
+          let minX = Infinity;
+          let maxX = -Infinity;
+          let minY = Infinity;
+          let maxY = -Infinity;
+          for (const [px, py] of corners) {
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+          }
+          return { x0: minX, y0: minY, x1: maxX, y1: maxY };
+        };
+
+        const pack = (data) =>
+          extractOcrWords(data).map((w) => ({
             text: w.text,
-            bbox: {
-              x0: w.bbox.y0,
-              y0: crop.height - w.bbox.x1,
-              x1: w.bbox.y1,
-              y1: crop.height - w.bbox.x0
-            },
+            bbox: backToCrop(w),
             confidence: w.confidence
           }));
-          if (rotWords2.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, '�').replace(/^0(?=\d)/, '�')))) {
-             words = rotWords2;
+
+        const engWords = pack(engRes.data);
+        const danWords = danRes ? pack(danRes.data) : [];
+
+        const overlap = (a, b) => {
+          const w = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+          const h = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+          if (w <= 0 || h <= 0) return 0;
+          const smaller = Math.min(
+            (a.x1 - a.x0) * (a.y1 - a.y0),
+            (b.x1 - b.x0) * (b.y1 - b.y0)
+          );
+          return smaller > 0 ? (w * h) / smaller : 0;
+        };
+
+        for (const w of danWords) {
+          if (!w.text || !/[Øø⌀∅]/.test(w.text)) continue;
+          if (!/\d/.test(w.text)) continue;
+          if (Number(w.confidence || 0) < 30) continue;
+          for (let i = engWords.length - 1; i >= 0; i--) {
+            if (overlap(w.bbox, engWords[i].bbox) >= 0.4) engWords.splice(i, 1);
+          }
+          engWords.push(w);
+        }
+
+        return engWords;
+      };
+
+      if (!readableWords(words) && words.length <= 2) {
+        const toRad = (deg) => (deg * Math.PI) / 180;
+        const dedupe = (angles) => {
+          const seen = [];
+          for (const angle of angles) {
+            if (seen.some((a) => Math.abs(a - angle) < toRad(4))) continue;
+            seen.push(angle);
+          }
+          return seen;
+        };
+
+        const tryAngles = async (angles) => {
+          for (const rotation of dedupe(angles)) {
+            let rotated = await readAtAngle(rotation);
+            /* Second look on the same angle: blank everything outside
+               the glyph rows, which is what a window full of leader
+               lines needs before Tesseract will read the value. */
+            if (!readableWords(rotated)) {
+              rotated = await readAtAngle(rotation, true);
+            }
+            if (!readableWords(rotated)) continue;
+            words = rotated;
+            console.log('[DimensionRead] Auto Detect read at angle:', {
+              degrees: Math.round((rotation * 180) / Math.PI)
+            });
+            return true;
+          }
+          return false;
+        };
+
+        /*
+          Straight text first (bottom-to-top, then top-to-bottom), and
+          only when both come back empty does the callout get treated
+          as a diagonal: a 5 degree grid walked from 45 outwards, each
+          angle read twice at most (plain, then glyph rows only). Stop
+          at the first read, so drawings with horizontal or vertical
+          text never pay for the extra passes.
+        */
+        let read = await tryAngles([-Math.PI / 2, Math.PI / 2]);
+
+        if (!read) {
+          /* 5 degree grid walked from 45° outwards - see the manual
+             path for why the grid beat estimating the angle. */
+          const sweep = [];
+          for (let deg = 5; deg <= 85; deg += 5) {
+            if (deg % 90 === 0) continue;
+            sweep.push(toRad(deg), toRad(-deg));
+          }
+          sweep.sort(
+            (a, b) =>
+              Math.min(Math.abs(a - toRad(45)), Math.abs(a + toRad(45))) -
+              Math.min(Math.abs(b - toRad(45)), Math.abs(b + toRad(45)))
+          );
+          read = await tryAngles(sweep.slice(0, 10));
+          if (!read) {
+            console.log('[DimensionRead] Auto Detect: no angle readable');
           }
         }
       }
@@ -2912,7 +5285,7 @@ const extractOcrWords = (data) => {
       if (inside.length > 0) {
         // Sort geographically for reading order: top-to-bottom, left-to-right
         inside.sort((a, b) => {
-          if (Math.abs(a.y - b.y) > 5) return a.y - b.y;
+          if (Math.abs(a.y - b.y) > 5 * dRatio) return a.y - b.y;
           return a.x - b.x;
         });
         const combinedText = inside.map(i => i.text).join(' ');
@@ -2925,7 +5298,7 @@ const extractOcrWords = (data) => {
           items,
           centerX,
           centerY,
-          70
+          70 * dRatio
         );
       }
 
@@ -2936,30 +5309,23 @@ const extractOcrWords = (data) => {
           confidence: 1
         };
 
-        // CAD PDFs often draw symbols (like Ø) as vector graphics while keeping the number as text.
-        // If the PDF result is a pure number without a symbol, let's run OCR to see if we missed a symbol!
-        if (/^\d+(?:\.\d+)?$/.test(pdfResult.value)) {
-          console.log("PDF text is a pure number. Running OCR to check for vector-drawn symbols...");
-          const ocrItems = await ocrReadRegion(rect);
-          if (ocrItems.length > 0) {
-            const ocrTarget = findNearestDimension(ocrItems, centerX, centerY, 70);
-            if (ocrTarget) {
-              const ocrResult = parseNearestDimension(ocrItems, ocrTarget);
-              // If OCR found a symbol like Ø13, use it!
-              if (ocrResult && ocrResult.value && !/^\d+(?:\.\d+)?$/.test(ocrResult.value)) {
-    const pdfNum = pdfResult.value.match(/\d+(?:\.\d+)?/)?.[0];
-    const ocrNum = ocrResult.value.match(/\d+(?:\.\d+)?/)?.[0];
-    if (pdfNum && ocrNum && Number(pdfNum) === Number(ocrNum)) {
-        pdfResult.value = ocrResult.value;
-        pdfResult.specification = ocrResult.specification || pdfResult.specification;
-        console.log("OCR rescued vector symbol:", ocrResult.value);
-    }
-}
-            }
-          }
-        }
+        /*
+          CAD PDFs often draw symbols (like Ø) as vector graphics while
+          keeping the number as text. Inspect the pixel slot before the
+          matching number and attach Ø when a ring glyph is present.
+        */
+        pdfResult = await attachGeometryDiameter(
+          pdfResult,
+          items,
+          centerX,
+          centerY
+        );
 
-        return pdfResult;
+        /* Skip OCR noise and tolerance-only readings - they would
+           otherwise become the stored value for this balloon. */
+        if (isReadableCallout(pdfResult)) {
+          return pdfResult;
+        }
       }
     }
 
@@ -2986,21 +5352,25 @@ const extractOcrWords = (data) => {
       let target = null;
       if (inside.length > 0) {
         inside.sort((a, b) => {
-          if (Math.abs(a.y - b.y) > 5) return a.y - b.y;
+          if (Math.abs(a.y - b.y) > 5 * dRatio) return a.y - b.y;
           return a.x - b.x;
         });
         const combinedText = inside.map(i => i.text).join(' ');
         target = { ...inside[0], text: combinedText };
       } else {
-        target = findNearestDimension(ocrItems, centerX, centerY, 90);
+        target = findNearestDimension(ocrItems, centerX, centerY, 90 * dRatio);
       }
 
       if (target) {
-        return {
+        const ocrResult = {
           ...parseNearestDimension(ocrItems, target),
           source: 'ocr',
           confidence: target.confidence
         };
+
+        if (isReadableCallout(ocrResult)) {
+          return ocrResult;
+        }
       }
     }
 
@@ -3411,7 +5781,7 @@ const extractOcrWords = (data) => {
              so unrelated dimensions don't merge.
           */
 
-          if (d < 45 && d < bestDistance) {
+          if (d < 45 * dRatio && d < bestDistance) {
             bestDistance = d;
             bestToleranceIndex = j;
           }
@@ -3805,9 +6175,21 @@ const extractOcrWords = (data) => {
           const width = Number(item.width || 0) * displayScale;
           const height = Number(item.height || 0) * displayScale;
 
+          const vt = baseViewport.transform;
+          const tr = item.transform || [1, 0, 0, 1, 0, 0];
+
+          const mat = [
+            (vt[0] * tr[0] + vt[2] * tr[1]) * displayScale,
+            (vt[1] * tr[0] + vt[3] * tr[1]) * displayScale,
+            (vt[0] * tr[2] + vt[2] * tr[3]) * displayScale,
+            (vt[1] * tr[2] + vt[3] * tr[3]) * displayScale
+          ];
+
           allTextItems.push({
             text: item.str.trim(),
             x, y, width, height,
+            mat,
+            source: 'pdf',
             centerX: x + width / 2,
             centerY: y + height / 2
           });
@@ -3864,26 +6246,51 @@ const extractOcrWords = (data) => {
         setMessage('Scanning vector shapes and vertical text...');
 
         try {
-          const ocrScale = 2.5;
+          const ocrScale = Math.min(Math.max(4, displayScale), 6);
           const ocrViewport = pdfPage.getViewport({ scale: ocrScale });
           const ocrCanvas = document.createElement('canvas');
           const ocrContext = ocrCanvas.getContext('2d');
           ocrCanvas.width = Math.ceil(ocrViewport.width);
           ocrCanvas.height = Math.ceil(ocrViewport.height);
           
-          ocrContext.filter = 'grayscale(1) contrast(160%) brightness(105%)';
+          ocrContext.filter = 'grayscale(1) blur(0.4px) contrast(175%) brightness(107%)';
           await pdfPage.render({ canvasContext: ocrContext, viewport: ocrViewport }).promise;
 
           if (!ocrWorkerRef.current) {
             ocrWorkerRef.current = await createWorker('eng', 1, { workerPath: '/tesseract/worker.min.js', corePath: '/tesseract/tesseract-core.wasm.js', langPath: '/tesseract' });
-            await ocrWorkerRef.current.setParameters({
-              tessedit_pageseg_mode: 11,
-              tessedit_char_whitelist: '0123456789.+-±ØRMDx°Hh ',
-            });
           }
+          await ocrWorkerRef.current.setParameters({
+            tessedit_pageseg_mode: '11'
+          });
 
-          const { data } = await ocrWorkerRef.current.recognize(ocrCanvas, {}, { blocks: true });
-          let words = extractOcrWords(data) || [];
+          const recognizePass = async (psm) => {
+            await ocrWorkerRef.current.setParameters({ tessedit_pageseg_mode: String(psm) });
+            const r = await ocrWorkerRef.current.recognize(ocrCanvas, {}, { blocks: true });
+            return extractOcrWords(r.data) || [];
+          };
+          const sameSpot = (a, b) => {
+            const d = Math.hypot(
+              (a.bbox.x0 + a.bbox.x1) / 2 - (b.bbox.x0 + b.bbox.x1) / 2,
+              (a.bbox.y0 + a.bbox.y1) / 2 - (b.bbox.y0 + b.bbox.y1) / 2
+            );
+            const sa = Math.max(a.bbox.x1 - a.bbox.x0, a.bbox.y1 - a.bbox.y0, 1);
+            const sb = Math.max(b.bbox.x1 - b.bbox.x0, b.bbox.y1 - b.bbox.y0, 1);
+            return d <= Math.max(14, Math.min(sa, sb) * 1.6);
+          };
+
+          /*
+            Two page-segmentation modes: sparse text finds most labels,
+            the uniform-block pass picks up dims tucked between dense
+            extension lines. Dedupe so nothing is counted twice.
+          */
+          let words = await recognizePass(11);
+          for (const extra of await recognizePass(6)) {
+            if (!words.some(w => String(w.text || '').trim() === String(extra.text || '').trim() && sameSpot(w, extra))) {
+              extra.__pass2 = true;
+              words.push(extra);
+            }
+          }
+          await ocrWorkerRef.current.setParameters({ tessedit_pageseg_mode: '11' });
 
           const ocrDetected = [];
           for (const word of words) {
@@ -3895,12 +6302,20 @@ const extractOcrWords = (data) => {
             const width = ((word.bbox.x1 - word.bbox.x0) / ocrScale) * displayScale;
             const height = ((word.bbox.y1 - word.bbox.y0) / ocrScale) * displayScale;
             
-            allTextItems.push({
-              text: word.text.trim(),
-              x, y, width, height,
-              centerX: x + width / 2,
-              centerY: y + height / 2
-            });
+            /*
+              Second-pass words are detection candidates only - they
+              are noisier, and feeding them into the page-context
+              model makes the table/grid filter reject real view
+              dimensions.
+            */
+            if (!word.__pass2) {
+              allTextItems.push({
+                text: word.text.trim(),
+                x, y, width, height,
+                centerX: x + width / 2,
+                centerY: y + height / 2
+              });
+            }
 
             if (!/\d/.test(text)) continue;
 
@@ -3952,10 +6367,14 @@ const extractOcrWords = (data) => {
       }
 
       if (roiRect) {
-          const minX = Math.min(roiRect.x1, roiRect.x2);
-          const maxX = Math.max(roiRect.x1, roiRect.x2);
-          const minY = Math.min(roiRect.y1, roiRect.y2);
-          const maxY = Math.max(roiRect.y1, roiRect.y2);
+          /* The box is stored page-relative; convert back to the
+             current canvas pixels so the filter matches whatever
+             zoom level detection runs at. */
+          const roi = roiRectToCanvas(roiRect);
+          const minX = Math.min(roi.x1, roi.x2);
+          const maxX = Math.max(roi.x1, roi.x2);
+          const minY = Math.min(roi.y1, roi.y2);
+          const maxY = Math.max(roi.y1, roi.y2);
 
           finalDetected = finalDetected.filter(item => {
              const centerX = item.x + item.width / 2;
@@ -3965,8 +6384,173 @@ const extractOcrWords = (data) => {
           });
         }
 
-        let limited = enhanceDetections(finalDetected, baseViewport.width * displayScale, baseViewport.height * displayScale);
-      limited = contextualFilter(limited, allTextItems, baseViewport.width * displayScale, baseViewport.height * displayScale);
+        let limited = enhanceDetections(finalDetected, baseViewport.width * displayScale, baseViewport.height * displayScale, dRatio);
+      limited = contextualFilter(limited, allTextItems, baseViewport.width * displayScale, baseViewport.height * displayScale, dRatio);
+
+      /* =========================================================
+         10.5 ATTACH VECTOR DIAMETER SYMBOLS
+         ---------------------------------------------------------
+         Ø is frequently drawn as vector art, so the text layer
+         only contains the number. For every accepted candidate
+         without a symbol, inspect the pixel slot before the
+         matching number and force the Ø symbol when a ring glyph
+         is present.
+      ========================================================= */
+
+      if (!isGarbledPDF && limited.length > 0) {
+        const pdfRaw = allTextItems.filter(
+          (t) => t.mat && t.source === 'pdf' && /\d/.test(t.text)
+        );
+
+        for (const item of limited) {
+          try {
+            if (
+              item.type === 'Angle' ||
+              item.type === 'Thread' ||
+              item.type === 'Radius'
+            ) {
+              continue;
+            }
+
+            const currentValue = String(item.value || item.text || '');
+
+            if (/^(SØ|SR|R|M)/i.test(currentValue.trim())) continue;
+
+            /*
+              Multi-line groups ("10 5.5") can mangle the parsed
+              value, so try every number in spec + value, in
+              order, until a geometric Ø is confirmed.
+              Tolerance-only numbers (0.05) are filtered per
+              number below.
+            */
+            const numbers = [];
+            const numRe = /\d+(?:\.\d+)?/g;
+            const sourceText = `${item.specification || ''} ${currentValue}`;
+            let numMatch;
+            while ((numMatch = numRe.exec(sourceText))) {
+              const n = numMatch[0];
+              if (
+                !numbers.includes(n) &&
+                !DETECTION_PATTERNS.smallTolerance.test(n)
+              ) {
+                numbers.push(n);
+              }
+            }
+            if (numbers.length === 0) continue;
+
+            const itemCenterX =
+              item.centerX != null ? item.centerX : detectionCenterX(item);
+            const itemCenterY =
+              item.centerY != null ? item.centerY : detectionCenterY(item);
+
+            for (const num of numbers) {
+              const near = pdfRaw
+                .filter((t) => {
+                  const m = String(t.text).match(/^\s*(\d+(?:\.\d+)?)/);
+                  if (!m || Number(m[1]) !== Number(num)) return false;
+
+                  return (
+                    Math.hypot(
+                      detectionCenterX(t) - itemCenterX,
+                      detectionCenterY(t) - itemCenterY
+                    ) < 120 * dRatio
+                  );
+                })
+                .sort(
+                  (a, b) =>
+                    Math.hypot(
+                      detectionCenterX(a) - itemCenterX,
+                      detectionCenterY(a) - itemCenterY
+                    ) -
+                    Math.hypot(
+                      detectionCenterX(b) - itemCenterX,
+                      detectionCenterY(b) - itemCenterY
+                    )
+                );
+
+              if (near.length === 0) {
+                if (window.__slotDebug) {
+                  console.log(
+                    '[diameter-detect] no pdf item for', num,
+                    'near', Math.round(itemCenterX) + ',' + Math.round(itemCenterY)
+                  );
+                }
+                continue;
+              }
+              if (!(await detectDiameterSymbol(near[0]))) continue;
+
+              const origSpec = String(
+                item.specification || item.text || ''
+              );
+              const merged = normalizeCallout({
+                specification: origSpec,
+                value: num,
+                plusTolerance: item.plusTolerance,
+                minusTolerance: item.minusTolerance,
+                type: 'Diameter'
+              });
+
+              if (merged) {
+                const qtyM = currentValue.match(
+                  /^\s*([1-9]\d*)\s*[x×]\s+/i
+                );
+                let newSpec;
+                let newVal = String(merged.value || '');
+
+                /*
+                  Quantity rows and stacked split parts keep the
+                  original note text ("2 × 5.5 THRU ALL",
+                  "3 x 4.2 12") with only the Ø symbol injected -
+                  normalizeCallout rebuilds the spec from the bare
+                  number and would drop quantity, depth and THRU
+                  wording.
+                */
+                if (
+                  (item.splitPart || qtyM) &&
+                  origSpec.includes(num) &&
+                  !/[\u00d8\u2300]/.test(origSpec)
+                ) {
+                  newSpec = origSpec.replace(
+                    new RegExp(
+                      `(^|[^\\d.])(${num.replace(/\./g, '\\.')})(?![\\d.])`
+                    ),
+                    '$1\u00d8 $2'
+                  );
+                } else {
+                  newSpec = String(merged.specification || '');
+                  if (qtyM && !newSpec.includes(qtyM[1])) {
+                    newSpec = `${qtyM[1]} X ${newSpec}`;
+                  }
+                }
+
+                /*
+                  Keep the quantity prefix ("3 × 4.2 12" ->
+                  "3 X Ø 4.2") - otherwise the rebuilt value
+                  would lose it.
+                */
+                if (qtyM && !newVal.includes(qtyM[1])) {
+                  newVal = `${qtyM[1]} X ${newVal}`;
+                }
+
+                Object.assign(item, merged, {
+                  specification: newSpec,
+                  value: newVal,
+                  text: newSpec
+                });
+                console.log(
+                  '[diameter-detect] auto Ø before',
+                  num,
+                  '->',
+                  newVal
+                );
+              }
+              break;
+            }
+          } catch (error) {
+            console.warn('[diameter-detect] auto failed:', error);
+          }
+        }
+      }
 
       /* =========================================================
          11. CHECK GROUPED RESULT
@@ -4011,6 +6595,8 @@ const extractOcrWords = (data) => {
       /* =========================================================
          13. CREATE BALLOONS + CHARACTERISTICS
       ========================================================= */
+
+      const metrics = canvasMetrics();
 
       let createdCount = 0;
 
@@ -4110,6 +6696,28 @@ const extractOcrWords = (data) => {
                 anchorY:
                   valueCenterY,
 
+                /* Page-relative position: stays locked to the
+                   detected dimension at every zoom level. */
+                xRel:
+                  metrics
+                    ? clamp01(balloonX / metrics.w)
+                    : null,
+
+                yRel:
+                  metrics
+                    ? clamp01(balloonY / metrics.h)
+                    : null,
+
+                anchorXRel:
+                  metrics
+                    ? clamp01(valueCenterX / metrics.w)
+                    : null,
+
+                anchorYRel:
+                  metrics
+                    ? clamp01(valueCenterY / metrics.h)
+                    : null,
+
                 /*
                   Store the ORIGINAL
                   dimension text.
@@ -4170,7 +6778,7 @@ const extractOcrWords = (data) => {
                   item.value,
 
                 unit:
-                  'mm',
+                  item.type === 'Angle' ? 'deg' : 'mm',
 
                 /*
                   GROUPED TOLERANCES
@@ -4187,10 +6795,10 @@ const extractOcrWords = (data) => {
                   item.minusTolerance,
 
                 upperLimit:
-                  item.upperLimit,
+                  item.upperLimit ?? '0.00',
 
                 lowerLimit:
-                  item.lowerLimit,
+                  item.lowerLimit ?? '0.00',
 
                 /*
                   Combined engineering
@@ -4232,6 +6840,16 @@ const extractOcrWords = (data) => {
                 y:
                   item.y,
 
+                xRel:
+                  metrics
+                    ? clamp01(item.x / metrics.w)
+                    : null,
+
+                yRel:
+                  metrics
+                    ? clamp01(item.y / metrics.h)
+                    : null,
+
                 status:
                   detectionStatus
               }
@@ -4256,6 +6874,26 @@ const extractOcrWords = (data) => {
 
                 y:
                   balloonY,
+
+                xRel:
+                  metrics
+                    ? clamp01(balloonX / metrics.w)
+                    : null,
+
+                yRel:
+                  metrics
+                    ? clamp01(balloonY / metrics.h)
+                    : null,
+
+                anchorXRel:
+                  metrics
+                    ? clamp01(valueCenterX / metrics.w)
+                    : null,
+
+                anchorYRel:
+                  metrics
+                    ? clamp01(valueCenterY / metrics.h)
+                    : null,
 
                 page:
                   pageNumber,
@@ -4311,6 +6949,16 @@ const extractOcrWords = (data) => {
 
                 y:
                   item.y,
+
+                xRel:
+                  metrics
+                    ? clamp01(item.x / metrics.w)
+                    : null,
+
+                yRel:
+                  metrics
+                    ? clamp01(item.y / metrics.h)
+                    : null,
 
                 page:
                   pageNumber
@@ -4438,31 +7086,31 @@ const extractOcrWords = (data) => {
           HEADER
       ===================================================== */}
 
-      <div className="sticky top-0 z-40 bg-slate-100 pt-6 -mt-6 pb-4">
-        <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm flex flex-wrap items-center justify-between gap-3">
+      <div className="sticky top-0 z-40 bg-slate-100 pb-2">
+        <div className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 shadow-sm flex flex-wrap items-center justify-between gap-2">
 
-        <div>
-          <div className="text-sm text-slate-500">
+        <div className="leading-tight">
+          <div className="text-xs text-slate-500">
             Project / Drawing Workspace
           </div>
 
-          <div className="font-semibold text-slate-900">
+          <div className="text-sm font-semibold text-slate-900">
             {project?.projectNumber ||
               'New Project'}
           </div>
 
-          <div className="text-sm text-slate-600">
+          <div className="text-xs text-slate-600">
             {project?.customerName} •{' '}
             {project?.drawingNumber} Rev{' '}
             {project?.revision}
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
 
           {/* SELECT AREA */}
             <button
-              className={`rounded border px-3 py-2 text-sm flex items-center gap-1 ${mode === 'select_area' ? 'bg-yellow-600 text-white' : ''}`}
+              className={`rounded border px-2 py-1 text-xs flex items-center gap-1 ${mode === 'select_area' ? 'bg-yellow-600 text-white' : ''}`}
               onClick={() => {
                 if (mode === 'select_area') {
                   setMode('none');
@@ -4479,7 +7127,7 @@ const extractOcrWords = (data) => {
             {/* ADD DIMENSION (toggle, shortcut: A) */}
 
           <button
-            className={`rounded border px-3 py-2 text-sm flex items-center gap-1 ${mode === 'manual'
+            className={`rounded border px-2 py-1 text-xs flex items-center gap-1 ${mode === 'manual'
               ? 'bg-slate-900 text-white'
               : ''
               }`}
@@ -4508,7 +7156,7 @@ const extractOcrWords = (data) => {
           {/* AUTO */}
 
           <button
-            className={`rounded border px-3 py-2 text-sm flex items-center gap-1 ${mode === 'auto'
+            className={`rounded border px-2 py-1 text-xs flex items-center gap-1 ${mode === 'auto'
               ? 'bg-blue-600 text-white'
               : ''
               }`}
@@ -4528,7 +7176,7 @@ const extractOcrWords = (data) => {
           {/* CLEAR ALL */}
 
           <button
-            className="rounded border border-red-300 px-3 py-2 text-sm text-red-600 hover:bg-red-50 flex items-center gap-1"
+            className="rounded border border-red-300 px-2 py-1 text-xs text-red-600 hover:bg-red-50 flex items-center gap-1"
             onClick={
               clearAllBallooning
             }
@@ -4546,7 +7194,7 @@ const extractOcrWords = (data) => {
           {/* DOWNLOAD PDF */}
 
           <button
-            className="rounded border px-3 py-2 text-sm ml-2"
+            className="rounded border px-2 py-1 text-xs ml-2"
             onClick={downloadPdf}
             disabled={!selectedDrawing}
           >
@@ -4556,12 +7204,12 @@ const extractOcrWords = (data) => {
           {/* ZOOM IN */}
 
           <button
-            className="rounded border px-3 py-2 text-sm"
+            className="rounded border px-2 py-1 text-xs"
             onClick={() =>
               setZoom((z) =>
                 Math.min(
-                  2,
-                  z + 0.1
+                  MAX_ZOOM,
+                  z + PHYSICAL_SCALE * 0.1
                 )
               )
             }
@@ -4576,12 +7224,12 @@ const extractOcrWords = (data) => {
           {/* ZOOM OUT */}
 
           <button
-            className="rounded border px-3 py-2 text-sm"
+            className="rounded border px-2 py-1 text-xs"
             onClick={() =>
               setZoom((z) =>
                 Math.max(
-                  0.5,
-                  z - 0.1
+                  MIN_ZOOM,
+                  z - PHYSICAL_SCALE * 0.1
                 )
               )
             }
@@ -4611,7 +7259,7 @@ const extractOcrWords = (data) => {
           MAIN AREA
       ===================================================== */}
 
-      <div className="grid gap-4 lg:grid-cols-[220px_minmax(0,1fr)_280px]">
+      <div className="grid gap-3 lg:grid-cols-[190px_minmax(0,1fr)_250px]">
 
         {/* ===================================================
             LEFT PANEL
@@ -4870,7 +7518,7 @@ const extractOcrWords = (data) => {
               <span className="text-xs text-slate-500">
                 Zoom{' '}
                 {Math.round(
-                  zoom * 100
+                  (zoom / PHYSICAL_SCALE) * 100
                 )}
                 %
               </span>
@@ -4981,16 +7629,45 @@ const extractOcrWords = (data) => {
                           (
                             balloon
                           ) => {
+                            if (
+                              !viewSize.w ||
+                              !viewSize.h
+                            ) {
+                              return null;
+                            }
+
+                            /*
+                              Positions are page-relative, so
+                              they are resolved against the
+                              current size of the drawing and
+                              therefore follow every zoom.
+                            */
+
                             const x =
-                              (balloon.x ?? 0) / dRatio;
+                              balloon.xRel != null
+                                ? balloon.xRel * viewSize.w
+                                : (balloon.x ?? 0) / legacyDRatio;
                             const y =
-                              (balloon.y ?? 0) / dRatio;
+                              balloon.yRel != null
+                                ? balloon.yRel * viewSize.h
+                                : (balloon.y ?? 0) / legacyDRatio;
+
+                            const hasPixelAnchor =
+                              (balloon.anchorX ?? 0) !== 0 ||
+                              (balloon.anchorY ?? 0) !== 0;
+
                             const ax =
-                              (balloon.anchorX ??
-                              (balloon.x ?? 0) + 12) / dRatio;
+                              balloon.anchorXRel != null
+                                ? balloon.anchorXRel * viewSize.w
+                                : hasPixelAnchor
+                                  ? (balloon.anchorX ?? 0) / legacyDRatio
+                                  : x + 25;
                             const ay =
-                              (balloon.anchorY ??
-                              (balloon.y ?? 0) + 12) / dRatio;
+                              balloon.anchorYRel != null
+                                ? balloon.anchorYRel * viewSize.h
+                                : hasPixelAnchor
+                                  ? (balloon.anchorY ?? 0) / legacyDRatio
+                                  : y + 25;
 
                             /*
                               Direction from the balloon
@@ -5096,8 +7773,14 @@ const extractOcrWords = (data) => {
                             key={balloon._id}
                             className="absolute pointer-events-auto balloon-marker cursor-move select-none"
                             style={{
-                              left: balloon.x / dRatio,
-                              top: balloon.y / dRatio,
+                              left:
+                                balloon.xRel != null && viewSize.w
+                                  ? balloon.xRel * viewSize.w
+                                  : (balloon.x ?? 0) / legacyDRatio,
+                              top:
+                                balloon.yRel != null && viewSize.h
+                                  ? balloon.yRel * viewSize.h
+                                  : (balloon.y ?? 0) / legacyDRatio,
                               transform:
                                 'translate(-50%, -50%)',
                               touchAction: 'none'
@@ -5136,16 +7819,22 @@ const extractOcrWords = (data) => {
 
                     {/* ROI RECTANGLE */}
                     {roiRect ? (
-                      <div
-                        className="absolute border-2 border-yellow-500 bg-yellow-400/20"
-                        style={{
-                          left: Math.min(roiRect.x1, roiRect.x2) / dRatio,
-                          top: Math.min(roiRect.y1, roiRect.y2) / dRatio,
-                          width: Math.abs(roiRect.x2 - roiRect.x1) / dRatio,
-                          height: Math.abs(roiRect.y2 - roiRect.y1) / dRatio,
-                          pointerEvents: 'none'
-                        }}
-                      />
+                      (() => {
+                        const roi = roiRectToCanvas(roiRect);
+
+                        return (
+                          <div
+                            className="absolute border-2 border-yellow-500 bg-yellow-400/20"
+                            style={{
+                              left: Math.min(roi.x1, roi.x2) / dRatio,
+                              top: Math.min(roi.y1, roi.y2) / dRatio,
+                              width: Math.abs(roi.x2 - roi.x1) / dRatio,
+                              height: Math.abs(roi.y2 - roi.y1) / dRatio,
+                              pointerEvents: 'none'
+                            }}
+                          />
+                        );
+                      })()
                     ) : null}
 
                     {/* ADD DIMENSION SELECTION RECTANGLE */}
@@ -5189,7 +7878,12 @@ const extractOcrWords = (data) => {
                   alt={
                     selectedDrawing.fileName
                   }
-                  className="max-h-[650px] max-w-full object-contain"
+                  /*
+                    No size cap: scaling a raster drawing down to
+                    fit the panel destroys exactly the detail the
+                    dimension text lives in.  The container scrolls.
+                  */
+                  className="block max-w-none"
                 />
 
               </div>
@@ -5207,7 +7901,7 @@ const extractOcrWords = (data) => {
 
               <button
                 onClick={() =>
-                  setZoom(1)
+                  setZoom(fitZoom())
                 }
                 className="rounded border bg-white px-3 py-2 text-sm"
               >
@@ -5219,6 +7913,20 @@ const extractOcrWords = (data) => {
               </button>
 
               <button
+                onClick={() =>
+                  setZoom(PHYSICAL_SCALE)
+                }
+                className={`rounded border px-3 py-2 text-sm ${
+                  Math.abs(zoom - PHYSICAL_SCALE) < 0.001
+                    ? 'bg-slate-900 text-white'
+                    : 'bg-white'
+                }`}
+                title="Show the drawing at its real printed size"
+              >
+                100%
+              </button>
+
+              <button
                 onClick={
                   previousPage
                 }
@@ -5226,7 +7934,7 @@ const extractOcrWords = (data) => {
                   pageNumber <=
                   1
                 }
-                className="rounded border px-3 py-2 text-sm disabled:opacity-40"
+                className="rounded border px-2 py-1 text-xs disabled:opacity-40"
               >
                 Previous
               </button>
@@ -5244,7 +7952,7 @@ const extractOcrWords = (data) => {
                   pageNumber >=
                   pageCount
                 }
-                className="rounded border px-3 py-2 text-sm disabled:opacity-40"
+                className="rounded border px-2 py-1 text-xs disabled:opacity-40"
               >
                 Next
               </button>
@@ -5308,31 +8016,47 @@ const extractOcrWords = (data) => {
                 type="text"
                 value={editData?.specification ?? ''}
                 onFocus={() => setFocusedField('specification')}
-                onChange={(e) =>
-                  setEditData((prev) =>
-                    prev
-                      ? {
+                onChange={(e) => {
+                  const typed = e.target.value;
+                  setEditData((prev) => {
+                    if (!prev) return prev;
+                    /* Keep Dimensions No / tolerances in step with
+                       the description as it is typed. */
+                    const synced = normalizeCallout(
+                      {
+                        specification: typed,
+                        value: typed,
+                        plusTolerance: prev.plusTolerance,
+                        minusTolerance: prev.minusTolerance
+                      },
+                      { prefer: 'spec' }
+                    );
+                    if (!synced) {
+                      /* "±0.05" alone parses as no callout - treat it
+                         as a symmetric tolerance for both boxes. */
+                      const symTol = extractSymmetricTol(typed);
+                      if (symTol) {
+                        return {
                           ...prev,
-                          specification: e.target.value
-                        }
-                      : prev
-                  )
-                }
+                          specification: typed,
+                          plusTolerance: symTol,
+                          minusTolerance: symTol
+                        };
+                      }
+                      return { ...prev, specification: typed };
+                    }
+                    return {
+                      ...prev,
+                      specification: typed,
+                      value: synced.value,
+                      plusTolerance: synced.plusTolerance,
+                      minusTolerance: synced.minusTolerance
+                    };
+                  });
+                }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     e.preventDefault();
-                    const parsed = parseSpecificationText(editData?.specification ?? '');
-                    if (parsed) {
-                      setEditData((prev) => {
-                        if (!prev) return prev;
-                        return {
-                          ...prev,
-                          value: parsed.mainValue || prev.value,
-                          plusTolerance: parsed.plusTol !== '' ? parsed.plusTol : prev.plusTolerance,
-                          minusTolerance: parsed.minusTol !== '' ? parsed.minusTol : prev.minusTolerance,
-                        };
-                      });
-                    }
                     setTimeout(() => saveEdit(), 50);
                   }
                 }}
@@ -5348,18 +8072,38 @@ const extractOcrWords = (data) => {
               <input
                 type="text"
                 value={editData?.value ?? ''}
-                onFocus={() => setFocusedField('value')}
-                onChange={(e) =>
+                onFocus={() => {
+                  valueNominalStashRef.current = editData?.value ?? '';
+                  setFocusedField('value');
+                }}
+                onChange={(e) => {
+                  const typed = e.target.value;
                   setEditData((prev) =>
                     prev
                       ? {
                           ...prev,
-                          value: e.target.value
+                          value: typed,
+                          specification: composeSpecification(
+                            typed,
+                            prev.plusTolerance,
+                            prev.minusTolerance,
+                            prev.specification
+                          )
                         }
                       : prev
-                  )
-                }
-                onBlur={saveEdit}
+                  );
+                }}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter') return;
+                  e.preventDefault();
+                  /*
+                    "±0.05" typed as the dimension is really a
+                    tolerance: put it into both tolerance boxes and
+                    give the field back its nominal number.
+                  */
+                  commitValueField();
+                }}
+                onBlur={commitValueField}
                 placeholder="—"
                 className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
@@ -5372,17 +8116,30 @@ const extractOcrWords = (data) => {
                 type="text"
                 value={editData?.plusTolerance ?? ''}
                 onFocus={() => setFocusedField('plusTolerance')}
-                onChange={(e) =>
+                onChange={(e) => {
+                  const typed = e.target.value;
                   setEditData((prev) =>
                     prev
                       ? {
                           ...prev,
-                          plusTolerance: e.target.value
+                          plusTolerance: typed,
+                          specification: composeSpecification(
+                            prev.value,
+                            typed,
+                            prev.minusTolerance,
+                            prev.specification
+                          )
                         }
                       : prev
-                  )
-                }
-                onBlur={saveEdit}
+                  );
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitTolField('plusTolerance');
+                  }
+                }}
+                onBlur={() => commitTolField('plusTolerance')}
                 placeholder="—"
                 className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
@@ -5395,17 +8152,30 @@ const extractOcrWords = (data) => {
                 type="text"
                 value={editData?.minusTolerance ?? ''}
                 onFocus={() => setFocusedField('minusTolerance')}
-                onChange={(e) =>
+                onChange={(e) => {
+                  const typed = e.target.value;
                   setEditData((prev) =>
                     prev
                       ? {
                           ...prev,
-                          minusTolerance: e.target.value
+                          minusTolerance: typed,
+                          specification: composeSpecification(
+                            prev.value,
+                            prev.plusTolerance,
+                            typed,
+                            prev.specification
+                          )
                         }
                       : prev
-                  )
-                }
-                onBlur={saveEdit}
+                  );
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitTolField('minusTolerance');
+                  }
+                }}
+                onBlur={() => commitTolField('minusTolerance')}
                 placeholder="—"
                 className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
@@ -5571,7 +8341,7 @@ const extractOcrWords = (data) => {
                               {characteristic.number || '-'}
                             </td>
                             <td className="px-4 py-3 text-slate-700">
-                              {characteristic.specification || '-'}
+                              {d.specification || '-'}
                             </td>
                             <td className="px-4 py-3 text-slate-700">
                               {d.mainVal || '-'}

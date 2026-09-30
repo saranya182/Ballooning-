@@ -1,12 +1,13 @@
-export const contextualFilter = (candidates, allTextItems, pageWidth, pageHeight) => {
+export const contextualFilter = (candidates, allTextItems, pageWidth, pageHeight, unitScale = 1) => {
   if (!candidates || candidates.length === 0) return [];
   if (!allTextItems || allTextItems.length === 0) return candidates;
 
   const validCandidates = [];
 
   // 1. Group all text items to find tables/grids
-  const xTols = 15;
-  const yTols = 15;
+  const u = unitScale > 0 ? unitScale : 1;
+  const xTols = 15 * u;
+  const yTols = 15 * u;
 
   allTextItems.forEach(item => {
     item.colAlignments = allTextItems.filter(o => Math.abs(o.centerX - item.centerX) < xTols).length;
@@ -31,7 +32,7 @@ export const contextualFilter = (candidates, allTextItems, pageWidth, pageHeight
 
     // Check if it's inside a structural table/BOM
     const nearbyTableCells = tableCells.filter(cell => 
-      Math.hypot(cell.centerX - candidate.centerX, cell.centerY - candidate.centerY) < 150
+      Math.hypot(cell.centerX - candidate.centerX, cell.centerY - candidate.centerY) < 150 * u
     );
 
     // If it's surrounded by table cells (BOM/Title block)
@@ -49,7 +50,7 @@ export const contextualFilter = (candidates, allTextItems, pageWidth, pageHeight
 
     const nearbyMetadataCells = allTextItems.filter(cell => 
       /^(REV|DATE|SCALE|WEIGHT|SHEET|MATERIAL|DRAWN|CHECKED|TOLERANCE|TITLE|DRAWING NO|PART NO)/i.test(cell.text) &&
-      Math.hypot(cell.centerX - candidate.centerX, cell.centerY - candidate.centerY) < 100
+      Math.hypot(cell.centerX - candidate.centerX, cell.centerY - candidate.centerY) < 100 * u
     );
 
     if (nearbyMetadataCells.length > 0) {
@@ -64,3 +65,4 @@ export const contextualFilter = (candidates, allTextItems, pageWidth, pageHeight
 
   return validCandidates;
 };
+

@@ -1,0 +1,12 @@
+names:
+- dimension
+nc: 1
+roboflow:
+  license: Private
+  project: dimension-detection-9urrc
+  url: https://app.roboflow.com/basavajyothi-v/dimension-detection-9urrc/2
+  version: 2
+  workspace: basavajyothi-v
+test: ./test/images
+train: ./train/images
+val: ./valid/images

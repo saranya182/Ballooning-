@@ -76,6 +76,14 @@ const balloonSchema = new mongoose.Schema({
   y: Number,
   anchorX: Number,
   anchorY: Number,
+  /*
+    Page-relative position (0..1). Unlike x/y (canvas pixels)
+    these never drift when the drawing is zoomed in or out.
+  */
+  xRel: Number,
+  yRel: Number,
+  anchorXRel: Number,
+  anchorYRel: Number,
   text: String,
   type: String,
   status: String,
@@ -103,6 +111,8 @@ const characteristicSchema = new mongoose.Schema({
   page: Number,
   x: Number,
   y: Number,
+  xRel: Number,
+  yRel: Number,
   status: String
 });
 const inspectionSchema = new mongoose.Schema({
