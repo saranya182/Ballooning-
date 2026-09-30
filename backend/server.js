@@ -21,6 +21,8 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/manufa
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, path.join(__dirname, 'uploads')),
@@ -633,6 +635,10 @@ app.post('/api/projects/:id/approval', async (req, res) => {
 
 app.post('/api/projects/:id/export', async (req, res) => {
   res.json({ success: true, message: 'Export placeholder ready' });
+});
+
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
 });
 
 mongoose.connect(MONGODB_URI)
